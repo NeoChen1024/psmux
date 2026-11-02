@@ -2334,12 +2334,16 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
                     .unwrap_or_default()
             } else { String::new() }
         }
-        "scroll_region_upper" => "0".into(),
-        "scroll_region_lower" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
-                return p.last_rows.saturating_sub(1).to_string();
+        // tmux format.c reads these off the target pane's own screen
+        // (wp->base.rupper / rlower), not the active pane's.
+        "scroll_region_upper" | "scroll_region_lower" => {
+            let region = target_pane()
+                .and_then(|p| p.live_parser().lock().ok().map(|parser| parser.screen().scroll_region()));
+            match region {
+                Some((upper, _)) if var == "scroll_region_upper" => upper.to_string(),
+                Some((_, lower)) => lower.to_string(),
+                None => "0".into(),
             }
-            "0".into()
         }
 
         // ── Buffer ──
@@ -2449,12 +2453,9 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
             mode.map(|m| crate::extended_keys::mode_name(m).to_string()).unwrap_or_default()
         }
         "alternate_on" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
-                if let Ok(parser) = p.term.lock() {
-                    if parser.screen().alternate_screen() { return "1".into(); }
-                }
-            }
-            "0".into()
+            let on = target_pane()
+                .and_then(|p| p.live_parser().lock().ok().map(|parser| parser.screen().alternate_screen()));
+            if on == Some(true) { "1".into() } else { "0".into() }
         }
         // tmux prints saved_cx/saved_cy, UINT_MAX while nothing is saved
         // (screen.c screen_alternate_off); it was a constant 0 (issue #810).
@@ -2498,9 +2499,28 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
             if on == Some(true) { "1".into() } else { "0".into() }
         }
 
+        // tmux format.c reads these off the target pane's screen mode too:
+        // MODE_ORIGIN, MODE_INSERT, MODE_WRAP, MODE_KCURSOR and MODE_KKEYPAD.
+        "origin_flag" | "insert_flag" | "wrap_flag" | "keypad_cursor_flag" | "keypad_flag" => {
+            let on = target_pane().and_then(|p| p.live_parser().lock().ok()).map(|parser| {
+                let screen = parser.screen();
+                match var {
+                    "origin_flag" => screen.origin_mode(),
+                    "insert_flag" => screen.insert_mode(),
+                    "wrap_flag" => screen.autowrap(),
+                    "keypad_cursor_flag" => screen.application_cursor(),
+                    _ => screen.application_keypad(),
+                }
+            });
+            match on {
+                Some(true) => "1".into(),
+                Some(false) => "0".into(),
+                None if var == "wrap_flag" => "1".into(),
+                None => "0".into(),
+            }
+        }
+
         // ── Misc ──
-        "origin_flag" | "insert_flag" | "keypad_cursor_flag" | "keypad_flag" => "0".into(),
-        "wrap_flag" => "1".into(),
         "line" | "command" | "command_list_name" | "command_list_alias" | "command_list_usage" | "config_files" => String::new(),
         "current_file" => crate::config::current_config_file(),
 
@@ -2731,6 +2751,10 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue662_mouse_flag_formats.rs"]
 mod tests_issue662_mouse_flag_formats;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_screen_mode_formats.rs"]
+mod tests_screen_mode_formats;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue272_format_shell_cache.rs"]
