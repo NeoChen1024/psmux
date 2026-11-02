@@ -105,6 +105,10 @@ path = "tests/issue919_input_buffer_size.rs"
 name = "issue962_sgr_bold_dim_overline"
 path = "tests/issue962_sgr_bold_dim_overline.rs"
 
+[[test]]
+name = "screen_modes"
+path = "tests/screen_modes.rs"
+
 [dependencies.itoa]
 version = "1.0.18"
 
