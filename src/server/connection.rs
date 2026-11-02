@@ -1741,6 +1741,26 @@ fn coalesce_send_commands(parts: Vec<String>) -> Vec<String> {
 /// block. The rest of the string is the command as the client sent it.
 const COALESCED_SEND_REPLY: &str = "\u{0001}COALESCED-SEND\u{0001}";
 
+/// The requests for `resize-pane -x` and `-y` (cells, or `N%` of the window),
+/// or None when neither flag is given. tmux applies both when both are given,
+/// -x first (cmd-resize-pane.c); the two routes used to read them as either
+/// or, so `-x 50 -y 10` dropped the -y. Shared by the plain CLI route and the
+/// control route.
+pub(crate) fn resize_pane_size_requests(args: &[&str]) -> Option<Vec<CtrlReq>> {
+    let mut given = false;
+    let mut reqs = Vec::new();
+    for (flag, axis) in [("-x", "x"), ("-y", "y")] {
+        let Some(val) = args.windows(2).find(|w| w[0] == flag).map(|w| w[1]) else { continue };
+        given = true;
+        if let Some(pct) = val.strip_suffix('%').and_then(|n| n.parse::<u8>().ok()) {
+            reqs.push(CtrlReq::ResizePanePercent(axis.to_string(), pct));
+        } else if let Ok(abs) = val.parse::<u16>() {
+            reqs.push(CtrlReq::ResizePaneAbsolute(axis.to_string(), abs));
+        }
+    }
+    given.then_some(reqs)
+}
+
 /// tmux's `break-pane` template when `-P` is given without `-F`
 /// (cmd-break-pane.c:29, BREAK_PANE_TEMPLATE).
 pub const BREAK_PANE_TEMPLATE: &str = "#{session_name}:#{window_index}.#{pane_index}";
@@ -4440,19 +4460,11 @@ match cmd {
         if args.iter().any(|a| *a == "-Z") {
             let _ = tx.send(CtrlReq::ZoomPane);
         } else
-        // Check for absolute resize (-x N or -y N), supporting both
+        // Check for absolute resize (-x N and/or -y N), supporting both
         // absolute values (e.g. "60") and percentage strings (e.g. "30%").
-        if let Some(xval) = args.windows(2).find(|w| w[0] == "-x").map(|w| w[1]) {
-            if let Some(pct) = xval.strip_suffix('%').and_then(|n| n.parse::<u8>().ok()) {
-                let _ = tx.send(CtrlReq::ResizePanePercent("x".to_string(), pct));
-            } else if let Ok(abs) = xval.parse::<u16>() {
-                let _ = tx.send(CtrlReq::ResizePaneAbsolute("x".to_string(), abs));
-            }
-        } else if let Some(yval) = args.windows(2).find(|w| w[0] == "-y").map(|w| w[1]) {
-            if let Some(pct) = yval.strip_suffix('%').and_then(|n| n.parse::<u8>().ok()) {
-                let _ = tx.send(CtrlReq::ResizePanePercent("y".to_string(), pct));
-            } else if let Ok(abs) = yval.parse::<u16>() {
-                let _ = tx.send(CtrlReq::ResizePaneAbsolute("y".to_string(), abs));
+        if let Some(reqs) = resize_pane_size_requests(&args) {
+            for req in reqs {
+                let _ = tx.send(req);
             }
         } else {
             let amount = args.iter().find(|a| a.parse::<u16>().is_ok()).and_then(|s| s.parse::<u16>().ok()).unwrap_or(1);
@@ -8202,17 +8214,9 @@ fn dispatch_control_command(
         "resize-pane" | "resizep" => {
             if args.iter().any(|a| *a == "-Z") {
                 let _ = tx.send(CtrlReq::ZoomPane);
-            } else if let Some(xval) = args.windows(2).find(|w| w[0] == "-x").map(|w| w[1]) {
-                if let Some(pct) = xval.strip_suffix('%').and_then(|n| n.parse::<u8>().ok()) {
-                    let _ = tx.send(CtrlReq::ResizePanePercent("x".to_string(), pct));
-                } else if let Ok(abs) = xval.parse::<u16>() {
-                    let _ = tx.send(CtrlReq::ResizePaneAbsolute("x".to_string(), abs));
-                }
-            } else if let Some(yval) = args.windows(2).find(|w| w[0] == "-y").map(|w| w[1]) {
-                if let Some(pct) = yval.strip_suffix('%').and_then(|n| n.parse::<u8>().ok()) {
-                    let _ = tx.send(CtrlReq::ResizePanePercent("y".to_string(), pct));
-                } else if let Ok(abs) = yval.parse::<u16>() {
-                    let _ = tx.send(CtrlReq::ResizePaneAbsolute("y".to_string(), abs));
+            } else if let Some(reqs) = resize_pane_size_requests(args) {
+                for req in reqs {
+                    let _ = tx.send(req);
                 }
             } else {
                 let amount = args.iter().filter(|a| !a.starts_with('-')).next()
@@ -9047,3 +9051,7 @@ mod tests_prompt_error_status_line;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue954_command_list_stops.rs"]
 mod tests_issue954_command_list_stops;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_resize_pane_both_axes.rs"]
+mod tests_resize_pane_both_axes;
