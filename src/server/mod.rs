@@ -8938,7 +8938,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                         "after-rename-session" => {
                             let name = app.session_name.clone();
-                            control::emit_notification(&app, crate::types::ControlNotification::SessionRenamed { name });
+                            control::emit_notification(&app, crate::types::ControlNotification::SessionRenamed {
+                                session_id: app.session_id, name,
+                            });
                         }
                         "client-attached" => {
                             let name = app.session_name.clone();

@@ -194,8 +194,8 @@ pub fn format_notification(notif: &ControlNotification) -> String {
         ControlNotification::SessionChanged { session_id, name } => {
             format!("%session-changed ${} {}", session_id, name)
         }
-        ControlNotification::SessionRenamed { name } => {
-            format!("%session-renamed {}", name)
+        ControlNotification::SessionRenamed { session_id, name } => {
+            format!("%session-renamed ${} {}", session_id, name)
         }
         ControlNotification::SessionWindowChanged { session_id, window_id } => {
             format!("%session-window-changed ${} @{}", session_id, window_id)
@@ -1035,10 +1035,12 @@ mod tests {
 
     #[test]
     fn test_format_notification_session_renamed() {
+        // tmux control_session_renamed_cb: "%session-renamed $%u %s".
         let line = format_notification(&ControlNotification::SessionRenamed {
+            session_id: 3,
             name: "my-session".to_string(),
         });
-        assert_eq!(line, "%session-renamed my-session");
+        assert_eq!(line, "%session-renamed $3 my-session");
     }
 
     #[test]

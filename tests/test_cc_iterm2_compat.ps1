@@ -223,7 +223,7 @@ Send-CC $cc "rename-session -t $S ${S}_renamed"
 $reply = Read-Reply $cc 1500
 Start-Sleep -Milliseconds 400
 $ev = $reply + (Drain-Notifications $cc 1000)
-if ($ev -match "%session-renamed ${S}_renamed") { P "%session-renamed" }
+if ($ev -match "%session-renamed \`$\d+ ${S}_renamed") { P "%session-renamed" }
 else { F "no %session-renamed: $ev" }
 # Update tracking name
 Send-CC $cc "rename-session -t ${S}_renamed $S"
