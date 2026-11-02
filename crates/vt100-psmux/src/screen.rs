@@ -444,6 +444,24 @@ impl Screen {
         self.grid().scrollback_filled()
     }
 
+    /// Runs `f` with the main grid in use, so `cell`, `row_wrapped`,
+    /// `scrollback` and `set_scrollback` reach the main grid's history while
+    /// the alternate grid is up.  tmux keeps a pane's history under its
+    /// alternate screen (screen_alternate_on leaves it in place), and
+    /// `capture-pane -S` reads the lines above the screen from it.  Only the
+    /// grid selection changes, and it is put back before this returns.
+    pub fn with_main_grid<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let alternate = self.mode(MODE_ALTERNATE_SCREEN);
+        if alternate {
+            self.clear_mode(MODE_ALTERNATE_SCREEN);
+        }
+        let out = f(self);
+        if alternate {
+            self.set_mode(MODE_ALTERNATE_SCREEN);
+        }
+        out
+    }
+
     /// Returns roughly how many bytes the main grid's scrollback holds: the
     /// cells the history rows actually store, plus per-row bookkeeping.  Since
     /// a row is compacted to its used width when it becomes history (issue
