@@ -363,7 +363,7 @@ psmux control mode is wire-compatible with tmux's protocol. The flow control and
 |---------|--------|-------|
 | `refresh-client -f` flags | Implemented | `pause-after=N` and `no-pause` are parsed and honored. Other tmux client flags are ignored. |
 | `refresh-client -A` pane actions | Implemented | `-A '%N:continue'` resumes a paused pane. `pause` is accepted but only `continue` takes effect. |
-| `refresh-client -B` subscriptions | Implemented | `-B 'name:target:format'` adds a subscription, `-B 'name:'` removes it. Values are re-checked at most once per second. |
+| `refresh-client -B` subscriptions | Implemented | `-B 'name:target:format'` adds a subscription, `-B 'name:'` removes it. As in tmux, a target of `%*` checks every pane of the session, `%N` one pane, `@*` every window, `@N` one window, and anything else the session; each pane or window is reported on its own line. Values are re-checked once per second. |
 | `refresh-client -C w,h` | Implemented | Sets the control client viewport size. Note the argument is comma separated (`-C 120,30`) on the control mode path, which is what iTerm2 sends. |
 | `%extended-output` | Implemented | Emitted instead of `%output` once a client has set `pause-after=N`, carrying the output age in milliseconds. |
 | `%subscription-changed` | Implemented | Emitted when a subscribed format string changes value. |

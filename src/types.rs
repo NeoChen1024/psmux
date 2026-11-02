@@ -73,9 +73,7 @@ pub enum ControlNotification {
     SubscriptionChanged {
         name: String,
         session_id: usize,
-        window_id: usize,
-        window_index: usize,
-        pane_id: usize,
+        object: crate::control::SubscriptionObject,
         value: String,
     },
     Exit { reason: Option<String> },
@@ -103,8 +101,9 @@ pub struct ControlClient {
     /// `refresh-client -B name:what:format` subscriptions.
     /// Key = subscription name, Value = (target, format_string).
     pub subscriptions: HashMap<String, (String, String)>,
-    /// Last expanded value for each subscription (for change detection).
-    pub subscription_values: HashMap<String, String>,
+    /// Last expanded value of each subscription, per object it covers (for
+    /// change detection).
+    pub subscription_values: HashMap<String, HashMap<crate::control::SubscriptionObject, String>>,
     /// Last time each subscription was checked (rate limit: 1/s per sub).
     pub subscription_last_check: HashMap<String, Instant>,
     /// pause-after age, paused panes and the per pane backlog age, shared
