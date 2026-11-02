@@ -99,6 +99,37 @@ pub fn layout_change(app: &AppState, win_idx: usize, area: Rect) -> Option<Contr
     })
 }
 
+/// Each window's id and #{window_layout}, read before a command that can lay
+/// out a window other than the current one (break-pane, join-pane,
+/// move-pane). Empty when no control client would be told anyway.
+pub fn window_layouts(app: &AppState) -> Vec<(usize, String)> {
+    if app.control_clients.is_empty() {
+        return Vec::new();
+    }
+    app.windows.iter().map(|w| (w.id, window_layout_string(w, w.area))).collect()
+}
+
+/// `%layout-change` for every window in `before` whose layout the command
+/// changed, except the current window, which the command's after hook
+/// announces. tmux notifies window-layout-changed for the source window of
+/// break-pane (layout_close_pane) and of join-pane and move-pane
+/// (cmd-join-pane.c), whichever window ends up current. A window that is not
+/// in `before` is new and gets `%window-add` instead.
+pub fn emit_other_layout_changes(app: &AppState, before: &[(usize, String)]) {
+    let current = app.windows.get(app.active_idx).map(|w| w.id);
+    for (idx, w) in app.windows.iter().enumerate() {
+        if Some(w.id) == current {
+            continue;
+        }
+        let Some((_, old)) = before.iter().find(|(id, _)| *id == w.id) else { continue };
+        if *old != window_layout_string(w, w.area) {
+            if let Some(n) = layout_change(app, idx, w.area) {
+                emit_notification(app, n);
+            }
+        }
+    }
+}
+
 /// A pane of the window with this id was killed. If the window stays, tmux
 /// sends `%layout-change` (layout_close_pane, notify_window
 /// "window-layout-changed"), then `%window-pane-changed` when the killed pane
@@ -163,8 +194,8 @@ pub fn format_notification(notif: &ControlNotification) -> String {
         ControlNotification::SessionChanged { session_id, name } => {
             format!("%session-changed ${} {}", session_id, name)
         }
-        ControlNotification::SessionRenamed { name } => {
-            format!("%session-renamed {}", name)
+        ControlNotification::SessionRenamed { session_id, name } => {
+            format!("%session-renamed ${} {}", session_id, name)
         }
         ControlNotification::SessionWindowChanged { session_id, window_id } => {
             format!("%session-window-changed ${} @{}", session_id, window_id)
@@ -1189,10 +1220,12 @@ mod tests {
 
     #[test]
     fn test_format_notification_session_renamed() {
+        // tmux control_session_renamed_cb: "%session-renamed $%u %s".
         let line = format_notification(&ControlNotification::SessionRenamed {
+            session_id: 3,
             name: "my-session".to_string(),
         });
-        assert_eq!(line, "%session-renamed my-session");
+        assert_eq!(line, "%session-renamed $3 my-session");
     }
 
     #[test]

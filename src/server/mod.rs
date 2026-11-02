@@ -6235,10 +6235,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::BreakPaneReq { req, print, resp } => {
                     unzoom_if_zoomed(&mut app);
+                    let layouts_before = control::window_layouts(&app);
                     match crate::window_ops::break_pane(&mut app, &req) {
                         Ok(broken) => {
                             crate::resize_window::refresh_dynamic_window_sizes(&mut app);
                             resize_all_panes(&mut app);
+                            control::emit_other_layout_changes(&app, &layouts_before);
                             // break-pane puts the pane in a NEW window, which
                             // tmux links into the session: cmd-break-pane.c:182
                             // `session_attach`, and session.c:333 fires
@@ -6265,6 +6267,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::JoinPane { src_raw, src, dst, horizontal, detach, before, resp, same_window, size } => {
                     unzoom_if_zoomed(&mut app);
+                    let layouts_before = control::window_layouts(&app);
                     // One implementation with the embedded fallback (#725);
                     // join_pane_request resolves %id ends and answers the
                     // refusals the CLI prints at exit 1.
@@ -6272,6 +6275,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     match r {
                         Ok(()) => {
                             resize_all_panes(&mut app);
+                            control::emit_other_layout_changes(&app, &layouts_before);
                             hook_event = Some("after-join-pane");
                         }
                         Err(ref e) => {
@@ -8942,7 +8946,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                         "after-rename-session" => {
                             let name = app.session_name.clone();
-                            control::emit_notification(&app, crate::types::ControlNotification::SessionRenamed { name });
+                            control::emit_notification(&app, crate::types::ControlNotification::SessionRenamed {
+                                session_id: app.session_id, name,
+                            });
                         }
                         "client-attached" => {
                             let name = app.session_name.clone();
@@ -8955,8 +8961,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 client: "client".to_string(),
                             });
                         }
+                        // select-layout notifies window-layout-changed
+                        // whether or not the layout differs
+                        // (cmd-select-layout.c, the `changed:` label).
                         "after-split-window" | "after-resize-pane" | "after-break-pane"
-                        | "after-join-pane" | "after-rotate-window" | "after-swap-pane" => {
+                        | "after-join-pane" | "after-rotate-window" | "after-swap-pane"
+                        | "after-select-layout" => {
                             let n = app.windows.iter().position(|w| w.id == win_id)
                                 .and_then(|idx| control::layout_change(&app, idx, app.windows[idx].area))
                                 .unwrap_or_else(|| {

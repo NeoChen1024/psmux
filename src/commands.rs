@@ -1039,6 +1039,9 @@ pub(crate) fn move_pane_in_window(app: &mut AppState, pos: usize, src_pane: Opti
             app.last_pane_path = prev;
         }
     }
+    // With -d the window need not be the current one.
+    let area = app.windows[pos].area;
+    crate::tree::resize_window_panes(app, pos, area);
     Ok(())
 }
 
@@ -1150,6 +1153,15 @@ pub(crate) fn join_pane_local(app: &mut AppState, src_win: Option<usize>, src_pa
         } else if app.active_idx >= app.windows.len() {
             app.active_idx = app.windows.len() - 1;
         }
+    }
+    // Both windows are laid out again, not just the one that ends up current:
+    // the source's panes fill the cell the moved pane left and the target's
+    // share theirs with it (cmd-join-pane.c layout_close_pane and
+    // layout_assign_pane, then server_redraw_window on each).
+    let src_left = if src_empty { None } else { Some(src_idx) };
+    for w in src_left.into_iter().chain((tgt < app.windows.len()).then_some(tgt)) {
+        let area = app.windows[w].area;
+        crate::tree::resize_window_panes(app, w, area);
     }
     true
 }
