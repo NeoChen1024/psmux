@@ -5108,6 +5108,25 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                         s.to_string()
                     }
                 }).collect::<Vec<String>>().join(" ");
+                // A -t naming a session that has no server is tmux's "no such
+                // session" (window, pane) at exit 1. The no-session warning
+                // below is for a command that named no session: it used to
+                // answer `set -t typo mouse on` too, at exit 0.
+                let missing_target = if explicit_session_target {
+                    parsed_set.missing_target_error(window_command)
+                } else {
+                    None
+                };
+                let no_server = |e: &io::Error| {
+                    let e = e.to_string();
+                    e.contains("no session") || e.contains("no server running")
+                };
+                let refuse_missing_target = |e: &io::Error| {
+                    if let (true, Some(msg)) = (no_server(e), missing_target.as_ref()) {
+                        eprintln!("psmux: {}", msg);
+                        std::process::exit(1);
+                    }
+                };
                 // Pane scope (#580): the server validates the option and the
                 // target pane and answers "ERROR: ..." on refusal. A silent
                 // fire-and-forget here would recreate the exit-0 silent no-op
@@ -5116,7 +5135,8 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                 // position is data, not a scope flag (#583).
                 let pane_scope = cli_pane_scope;
                 if pane_scope {
-                    let resp = send_control_with_response(format!("{}\n", cmd_str))?;
+                    let resp = send_control_with_response(format!("{}\n", cmd_str))
+                        .inspect_err(|e| refuse_missing_target(e))?;
                     if resp.trim_start().starts_with("ERROR") {
                         eprintln!("psmux: {}", resp.trim_start().trim_start_matches("ERROR:").trim());
                         std::process::exit(1);
@@ -5139,8 +5159,8 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                                 std::process::exit(1);
                             }
                         }
-                        Err(e) if e.to_string().contains("no session")
-                            || e.to_string().contains("no server running") => {
+                        Err(e) if no_server(&e) => {
+                            refuse_missing_target(&e);
                             eprintln!("warning: no active session; option will take effect when set inside a session or via config file");
                         }
                         Err(e) => return Err(e),
@@ -5159,8 +5179,8 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                             std::process::exit(1);
                         }
                     }
-                    Err(e) if e.to_string().contains("no session")
-                        || e.to_string().contains("no server running") => {
+                    Err(e) if no_server(&e) => {
+                        refuse_missing_target(&e);
                         eprintln!("warning: no active session; option will take effect when set inside a session or via config file");
                     }
                     Err(e) => return Err(e),

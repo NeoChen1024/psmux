@@ -2153,6 +2153,41 @@ impl ParsedSetOptionArgs<'_> {
             &self.positionals[1..].join(" "),
         )
     }
+
+    /// tmux's refusal when the `-t` names no session (options.c
+    /// options_scope_from_name / options_scope_from_flags): set-option's
+    /// target lookup may fail, and then the scope that has nothing to act on
+    /// is "no such session|window|pane: <target>". None when there is no `-t`
+    /// or the option does not need it: a server option, `-s`, or `-g` on a
+    /// session or window option.
+    pub fn missing_target_error(&self, window_command: bool) -> Option<String> {
+        use crate::server::option_catalog::OptionScope;
+        let target = self.target?;
+        let flags = self.flag_chars.as_str();
+        let option = self.positionals.first().copied().unwrap_or("");
+        let option = option.split('[').next().unwrap_or(option);
+        // A name tmux cannot match is refused (or, with -q, ignored) before
+        // the scope is looked at.
+        let scope = if option.starts_with('@') {
+            None
+        } else {
+            Some(crate::server::option_catalog::option_definition(option)?.scope)
+        };
+        let what = match scope {
+            Some(OptionScope::Server) => return None,
+            Some(OptionScope::Session) if flags.contains('g') => return None,
+            Some(OptionScope::Session) => "session",
+            Some(OptionScope::Window | OptionScope::Pane) if flags.contains('p') => "pane",
+            Some(OptionScope::Window | OptionScope::Pane) if flags.contains('g') => return None,
+            Some(OptionScope::Window | OptionScope::Pane) => "window",
+            None if flags.contains('s') => return None,
+            None if flags.contains('p') => "pane",
+            None if flags.contains('g') => return None,
+            None if window_command || flags.contains('w') => "window",
+            None => "session",
+        };
+        Some(format!("no such {}: {}", what, target))
+    }
 }
 
 pub(crate) fn parse_set_option_args<'a>(args: &[&'a str]) -> ParsedSetOptionArgs<'a> {
@@ -2521,3 +2556,7 @@ mod tests_issue865_display_reply_error;
 #[cfg(test)]
 #[path = "../tests-rs/test_empty_pane_target.rs"]
 mod tests_empty_pane_target;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_set_option_missing_target.rs"]
+mod tests_set_option_missing_target;
