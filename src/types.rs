@@ -2919,11 +2919,19 @@ impl AppState {
                     }
                     None => {
                         // No colon: tmux's cmd_find_get_window tries a window of
-                        // the current session first, then a session.
+                        // the current session first, then a session, and a miss
+                        // is "can't find window". The only session this server
+                        // can put a window in is its own.
                         match self.resolve_window_spec(t, true) {
                             Ok(WindowTarget::Pos(p)) => (Some(p), Some(self.win_display_index(p))),
                             Ok(WindowTarget::FreeIndex(i)) => (None, Some(i)),
-                            Err(_) => (active, None),
+                            Err(_) if self.names_this_session(t) => (active, None),
+                            Err(e) => {
+                                if let Some(s) = crate::commands::foreign_session_in_spec(self, &format!("{}:", t)) {
+                                    return Err(format!("new-window: target is in session {} (each session runs in its own psmux server)", s));
+                                }
+                                return Err(e);
+                            }
                         }
                     }
                 }
@@ -3609,6 +3617,16 @@ impl AppState {
     /// Otherwise, just the session_name is used.
     pub fn port_file_base(&self) -> String {
         crate::session::session_name_base(self.socket_name.as_deref(), &self.session_name)
+    }
+
+    /// Whether a bare target token (`=` marker allowed) names this session:
+    /// its name, or its `$id`.
+    pub fn names_this_session(&self, spec: &str) -> bool {
+        let spec = crate::cli::strip_exact_match_prefix(spec.trim());
+        match spec.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) {
+            Some(id) => id == self.session_id,
+            None => spec == self.session_name,
+        }
     }
 }
 
