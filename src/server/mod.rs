@@ -9278,63 +9278,53 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         // Zero cost when no clients have subscriptions.
         if !app.control_clients.is_empty() {
             let now_sub = std::time::Instant::now();
-            // Phase 1: collect (client_id, sub_name, format) pairs that need checking
-            let mut to_check: Vec<(u64, String, String)> = Vec::new();
+            // Phase 1: collect (client_id, sub_name, target, format) that need checking
+            let mut to_check: Vec<(u64, String, String, String)> = Vec::new();
             for client in app.control_clients.values_mut() {
                 if client.subscriptions.is_empty() {
                     continue;
                 }
                 let sub_names: Vec<String> = client.subscriptions.keys().cloned().collect();
                 for name in sub_names {
-                    // Rate limit: at most once per second per subscription
+                    // Rate limit: at most once per second per subscription,
+                    // the period of tmux's control_check_subs_timer.
                     if let Some(last) = client.subscription_last_check.get(&name) {
                         if now_sub.duration_since(*last).as_secs() < 1 {
                             continue;
                         }
                     }
                     client.subscription_last_check.insert(name.clone(), now_sub);
-                    let format = client.subscriptions[&name].1.clone();
-                    to_check.push((client.client_id, name, format));
+                    let (target, format) = client.subscriptions[&name].clone();
+                    to_check.push((client.client_id, name, target, format));
                 }
             }
-            // Phase 2: expand formats with immutable borrow of app
-            let mut sub_results: Vec<(u64, String, String)> = Vec::new();
-            for (cid, name, format) in &to_check {
-                let expanded = crate::format::expand_format(format, &app);
-                sub_results.push((*cid, name.clone(), expanded));
-            }
-            // Phase 3: compare and emit notifications
-            let active_win = &app.windows[app.active_idx];
-            let win_id = active_win.id;
-            let pane_id = get_active_pane_id(&active_win.root, &active_win.active_path).unwrap_or(0);
+            // Phase 2: expand each format for every object its target covers,
+            // with an immutable borrow of app
+            let sub_results: Vec<(u64, String, Vec<(crate::control::SubscriptionObject, String)>)> = to_check
+                .into_iter()
+                .map(|(cid, name, target, format)| {
+                    let values = crate::control::evaluate_subscription(&app, &target, &format);
+                    (cid, name, values)
+                })
+                .collect();
+            // Phase 3: emit a notification for every object whose value
+            // changed, and keep the values of the objects that still exist
             let session_id = app.session_id;
-            let win_idx = app.active_idx;
             let mut sub_notifs: Vec<(u64, crate::types::ControlNotification)> = Vec::new();
-            for (cid, name, expanded) in sub_results {
-                if let Some(cc) = app.control_clients.get(&cid) {
-                    let changed = match cc.subscription_values.get(&name) {
-                        Some(prev) => prev != &expanded,
-                        None => true,
-                    };
-                    if changed {
+            for (cid, name, values) in sub_results {
+                let Some(cc) = app.control_clients.get_mut(&cid) else { continue };
+                let previous = cc.subscription_values.remove(&name).unwrap_or_default();
+                for (object, value) in &values {
+                    if previous.get(object) != Some(value) {
                         sub_notifs.push((cid, crate::types::ControlNotification::SubscriptionChanged {
                             name: name.clone(),
                             session_id,
-                            window_id: win_id,
-                            window_index: win_idx,
-                            pane_id,
-                            value: expanded.clone(),
+                            object: *object,
+                            value: value.clone(),
                         }));
                     }
                 }
-            }
-            // Phase 4: update cached values and send notifications
-            for (cid, ref notif) in &sub_notifs {
-                if let Some(cc) = app.control_clients.get_mut(cid) {
-                    if let crate::types::ControlNotification::SubscriptionChanged { name, value, .. } = notif {
-                        cc.subscription_values.insert(name.clone(), value.clone());
-                    }
-                }
+                cc.subscription_values.insert(name, values.into_iter().collect());
             }
             for (cid, notif) in sub_notifs {
                 if let Some(cc) = app.control_clients.get(&cid) {

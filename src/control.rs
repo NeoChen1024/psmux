@@ -192,8 +192,15 @@ pub fn format_notification(notif: &ControlNotification) -> String {
         ControlNotification::PaneOutput { pane_id, data, .. } => {
             format!("%output %{} {}", pane_id, escape_output(data))
         }
-        ControlNotification::SubscriptionChanged { name, session_id, window_id, window_index, pane_id, value } => {
-            format!("%subscription-changed {} ${} @{} {} %{} : {}", name, session_id, window_id, window_index, pane_id, value)
+        // control.c writes `-` for the window and pane a session or window
+        // subscription does not name.
+        ControlNotification::SubscriptionChanged { name, session_id, object, value } => {
+            let (window_id, window_index) = match object.window {
+                Some((id, index)) => (format!("@{id}"), index.to_string()),
+                None => ("-".to_string(), "-".to_string()),
+            };
+            let pane_id = object.pane_id.map_or_else(|| "-".to_string(), |id| format!("%{id}"));
+            format!("%subscription-changed {} ${} {} {} {} : {}", name, session_id, window_id, window_index, pane_id, value)
         }
         ControlNotification::Exit { reason } => {
             if let Some(r) = reason {
@@ -616,6 +623,83 @@ pub fn parse_pause_after_flag(flag: &str) -> Option<Option<u64>> {
         digits.parse::<u64>().ok()?
     };
     Some(if not { None } else { Some(secs) })
+}
+
+/// What a `refresh-client -B name:what:format` subscription watches, read from
+/// `what` as tmux's cmd_refresh_client_update_subscription does: `%*` every
+/// pane of the session, `%N` one pane, `@*` every window, `@N` one window,
+/// and anything else the session itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriptionTarget {
+    Session,
+    Pane(usize),
+    AllPanes,
+    Window(usize),
+    AllWindows,
+}
+
+pub fn parse_subscription_target(what: &str) -> SubscriptionTarget {
+    let id = |rest: &str| -> Option<usize> {
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse().ok()
+    };
+    match what {
+        "%*" => SubscriptionTarget::AllPanes,
+        "@*" => SubscriptionTarget::AllWindows,
+        _ => {
+            if let Some(n) = what.strip_prefix('%').and_then(id) {
+                SubscriptionTarget::Pane(n)
+            } else if let Some(n) = what.strip_prefix('@').and_then(id) {
+                SubscriptionTarget::Window(n)
+            } else {
+                SubscriptionTarget::Session
+            }
+        }
+    }
+}
+
+/// The object one `%subscription-changed` line is about. A session
+/// subscription names neither a window nor a pane, a window subscription names
+/// the window (`@id` and its index) but no pane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SubscriptionObject {
+    pub window: Option<(usize, usize)>,
+    pub pane_id: Option<usize>,
+}
+
+/// Expand a subscription's format once for every object its target covers,
+/// in window then pane order, the way control.c control_check_subs_* walks
+/// them, each with that window and pane as the format's target.
+pub fn evaluate_subscription(app: &AppState, what: &str, format: &str) -> Vec<(SubscriptionObject, String)> {
+    let target = parse_subscription_target(what);
+    if target == SubscriptionTarget::Session {
+        return vec![(SubscriptionObject::default(), crate::format::expand_format(format, app))];
+    }
+    let mut out = Vec::new();
+    for (win_idx, win) in app.windows.iter().enumerate() {
+        let window = Some((win.id, app.win_display_index(win_idx)));
+        match target {
+            SubscriptionTarget::Window(id) if id != win.id => continue,
+            SubscriptionTarget::Window(_) | SubscriptionTarget::AllWindows => {
+                let value = crate::format::expand_format_for_window(format, app, win_idx);
+                out.push((SubscriptionObject { window, pane_id: None }, value));
+                continue;
+            }
+            _ => {}
+        }
+        // Positions as #{P:} and list-panes count them: tiled panes, then
+        // floating ones.
+        let mut ids = crate::tree::collect_pane_ids(&win.root);
+        ids.extend(win.floating.iter().map(|fp| fp.id));
+        for (pos, pane_id) in ids.into_iter().enumerate() {
+            if matches!(target, SubscriptionTarget::Pane(id) if id != pane_id) {
+                continue;
+            }
+            let value = crate::format::expand_format_for_pane(format, app, win_idx, pos);
+            out.push((SubscriptionObject { window, pane_id: Some(pane_id) }, value));
+        }
+    }
+    out
 }
 
 /// tmux's limit for a control client that does not use pause-after: once its
@@ -1177,12 +1261,28 @@ mod tests {
         let line = format_notification(&ControlNotification::SubscriptionChanged {
             name: "mysub".to_string(),
             session_id: 0,
-            window_id: 1,
-            window_index: 0,
-            pane_id: 3,
+            object: SubscriptionObject { window: Some((1, 0)), pane_id: Some(3) },
             value: "pwsh".to_string(),
         });
         assert_eq!(line, "%subscription-changed mysub $0 @1 0 %3 : pwsh");
+    }
+
+    #[test]
+    fn test_format_notification_subscription_changed_window_and_session() {
+        let line = format_notification(&ControlNotification::SubscriptionChanged {
+            name: "win".to_string(),
+            session_id: 0,
+            object: SubscriptionObject { window: Some((2, 1)), pane_id: None },
+            value: "x".to_string(),
+        });
+        assert_eq!(line, "%subscription-changed win $0 @2 1 - : x");
+        let line = format_notification(&ControlNotification::SubscriptionChanged {
+            name: "ses".to_string(),
+            session_id: 0,
+            object: SubscriptionObject::default(),
+            value: "y".to_string(),
+        });
+        assert_eq!(line, "%subscription-changed ses $0 - - - : y");
     }
 
     #[test]
@@ -1246,9 +1346,7 @@ mod tests {
         let line = format_notification(&ControlNotification::SubscriptionChanged {
             name: "test_sub".to_string(),
             session_id: 1,
-            window_id: 2,
-            window_index: 3,
-            pane_id: 4,
+            object: SubscriptionObject { window: Some((2, 3)), pane_id: Some(4) },
             value: String::new(),
         });
         assert_eq!(line, "%subscription-changed test_sub $1 @2 3 %4 : ");
@@ -1262,6 +1360,10 @@ mod tests_issue811_window_notifications;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue825_control_detach.rs"]
 mod tests_issue825_control_detach;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_control_subscriptions.rs"]
+mod tests_control_subscriptions;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue824_827_cc.rs"]
