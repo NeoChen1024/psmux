@@ -4575,6 +4575,280 @@ impl CprScanner {
     }
 }
 
+/// How long a control client's batch of commands may keep the panes held
+/// (`hold_pane_output`) before their output flows again on its own: the
+/// client normally releases them as soon as its batch is answered, this only
+/// bounds a batch that never ends.
+pub(crate) const OUTPUT_HOLD_MAX: Duration = Duration::from_millis(100);
+
+/// The control clients holding a pane: until `until`, the pane's parser takes
+/// no new output and its ring is not drained, so every reply in their
+/// batches describes the same screen as the `%output` sent before it.
+struct OutputHold {
+    owners: Vec<u64>,
+    until: Instant,
+}
+
+#[derive(Default)]
+struct Staging {
+    bytes: Vec<u8>,
+    /// The reader thread is gone.
+    done: bool,
+    hold: Option<OutputHold>,
+}
+
+impl Staging {
+    fn hold_left(&self, now: Instant) -> Option<Duration> {
+        self.hold.as_ref().filter(|h| h.until > now).map(|h| h.until - now)
+    }
+}
+
+/// What a pane's reader thread hands its parser thread. The server loop
+/// reaches it too, through `FEEDS`, for control mode's reply barrier.
+///
+/// Lock order: `parse`, then `staging`, then the output ring.
+struct PaneFeed {
+    staging: Mutex<Staging>,
+    cv: Condvar,
+    parse: Mutex<PaneParse>,
+}
+
+/// The feeds of the live panes, by the address of their output ring.
+static FEEDS: Mutex<Option<std::collections::HashMap<usize, std::sync::Weak<PaneFeed>>>> = Mutex::new(None);
+
+fn register_feed(ring: &crate::control_ring::Ring, feed: &Arc<PaneFeed>) {
+    let mut feeds = FEEDS.lock().unwrap_or_else(|e| e.into_inner());
+    feeds.get_or_insert_with(Default::default).insert(crate::control_ring::key(ring), Arc::downgrade(feed));
+}
+
+fn unregister_feed(key: usize, feed: &Arc<PaneFeed>) {
+    let mut feeds = FEEDS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = feeds.as_mut() {
+        if map.get(&key).map_or(false, |w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(feed))) {
+            map.remove(&key);
+        }
+    }
+}
+
+fn feed_for(ring: &crate::control_ring::Ring) -> Option<Arc<PaneFeed>> {
+    let feeds = FEEDS.lock().unwrap_or_else(|e| e.into_inner());
+    feeds.as_ref()?.get(&crate::control_ring::key(ring))?.upgrade()
+}
+
+/// Control mode's reply barrier on one pane. tmux queues a pane's output for
+/// its control clients and parses it in the same callback
+/// (window_pane_read_callback), and runs a client's commands between two such
+/// callbacks, so a reply describes exactly the output sent before it. Here
+/// the reader, the parser and the ring drain are separate threads, so the
+/// barrier makes that true: everything the pane's reader has read is parsed
+/// now, the ring is drained to the same byte, and the pane is held, its
+/// parser and its `%output` stopped, until `owner`'s batch is answered
+/// (`release_pane_output`) or `OUTPUT_HOLD_MAX` passes. A pane already held,
+/// by `owner` or by another control client, stays at its cut: that cut's
+/// `%output` is already queued for every client ahead of their fences, and a
+/// new cut would put output behind a fence whose reply already sees it.
+/// Returns the bytes to queue as `%output` ahead of the reply.
+pub(crate) fn hold_pane_output(ring: &crate::control_ring::Ring, owner: u64, now: Instant) -> Vec<u8> {
+    let Some(feed) = feed_for(ring) else {
+        return crate::control_ring::drain(ring);
+    };
+    let mut parse = feed.parse.lock().unwrap_or_else(|e| e.into_inner());
+    let (bytes, out) = {
+        let mut st = feed.staging.lock().unwrap_or_else(|e| e.into_inner());
+        if st.hold_left(now).is_some() {
+            if let Some(hold) = st.hold.as_mut() {
+                if !hold.owners.contains(&owner) {
+                    hold.owners.push(owner);
+                }
+            }
+            return Vec::new();
+        }
+        st.hold = Some(OutputHold { owners: vec![owner], until: now + OUTPUT_HOLD_MAX });
+        (std::mem::take(&mut st.bytes), crate::control_ring::drain(ring))
+    };
+    parse.process(bytes, true);
+    out
+}
+
+/// `owner`'s batch is answered: its panes parse and send output again once no
+/// other control client holds them.
+pub(crate) fn release_pane_output(owner: u64) {
+    let feeds: Vec<Arc<PaneFeed>> = {
+        let feeds = FEEDS.lock().unwrap_or_else(|e| e.into_inner());
+        feeds.iter().flat_map(|m| m.values()).filter_map(|w| w.upgrade()).collect()
+    };
+    for feed in feeds {
+        let mut st = feed.staging.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(hold) = st.hold.as_mut() else { continue };
+        if !hold.owners.contains(&owner) {
+            continue;
+        }
+        hold.owners.retain(|&o| o != owner);
+        if hold.owners.is_empty() {
+            st.hold = None;
+            feed.cv.notify_all();
+        }
+    }
+}
+
+/// Whether a control client's batch holds this pane's output right now.
+pub(crate) fn pane_output_held(ring: &crate::control_ring::Ring, now: Instant) -> bool {
+    feed_for(ring).map_or(false, |feed| {
+        feed.staging.lock().unwrap_or_else(|e| e.into_inner()).hold_left(now).is_some()
+    })
+}
+
+/// A pane's parser side: everything that turns a batch of its output into
+/// screen state, used by its parser thread and by `hold_pane_output`.
+struct PaneParse {
+    term: Arc<Mutex<vt100::Parser>>,
+    dv_writer: Arc<std::sync::atomic::AtomicU64>,
+    cursor_shape: Arc<std::sync::atomic::AtomicU8>,
+    bell_pending: Arc<std::sync::atomic::AtomicBool>,
+    cpr_pending: Arc<std::sync::atomic::AtomicBool>,
+    color_query_pending: Arc<std::sync::atomic::AtomicU32>,
+    pane_id: usize,
+    child_pid: Option<u32>,
+    cpr_scanner: CprScanner,
+    query_detector: vt100::QueryDetector,
+    // Issue #685: the palette generation last mirrored into
+    // `types::PANE_PALETTES`.  A fresh parser starts at 0 with an empty
+    // palette, so a pane id reused by respawn-pane withdraws whatever the
+    // previous child published the moment its successor writes anything.
+    published_palette_gen: u64,
+    // DECSET 2026: output held back between `ESC[?2026h` and `ESC[?2026l`.
+    sync_gate: SyncGate,
+    // The first DA1 of a pane is the console host's own, answered down
+    // the PTY (`pane_replies`).
+    console_host_da1_open: bool,
+}
+
+impl PaneParse {
+    /// Parse one batch. `release` lets out whatever an open synchronized
+    /// update holds back, for a reply that has to describe the output its
+    /// client was already sent.
+    fn process(&mut self, bytes: Vec<u8>, release: bool) {
+        // The query scanners see every byte as it arrives, BEFORE the
+        // synchronized output gate: a program that asks a question inside
+        // an open update is blocked on the answer and will not close the
+        // update first, so the gate must not sit on the question for its
+        // one second timeout (PR #781).  A query releases what is held.
+        let has_cpr_query = self.cpr_scanner.scan(&bytes);
+        let program_status = crate::types::PROGRAM_STATUS_ENABLED.load(Ordering::Acquire);
+        self.query_detector.set_program_status_enabled(program_status);
+        let has_reply_request = self.query_detector.scan(&bytes);
+        let flush = has_cpr_query || has_reply_request || release;
+        let bytes = self.sync_gate.feed(bytes, Instant::now(), flush);
+        if bytes.is_empty() { return; }
+
+        // Scan for cursor shape and RMCUP on the raw batch BEFORE
+        // handing to vt100 parser (preserves prior ordering semantics).
+        if let Some(shape) = scan_cursor_shape(&bytes) {
+            self.cursor_shape.store(shape, Ordering::Release);
+        }
+        let rmcup = scan_rmcup(&bytes);
+        let mut device_queries = Vec::new();
+
+        // Issue #502 diagnostic: capture the exact pre-parse byte stream
+        // when PSMUX_PANE_RAW=1. Off by default, one atomic load when off.
+        crate::debug_log::pane_raw(&bytes);
+
+        // Issue #597: sampled inside the parser lock below, so a DECRQM
+        // that shares a write with the DECSET it asks about reports the
+        // post-write value, the way tmux's in-order dispatch does.
+        let mut decrqm_state: Option<DecrqmState> = None;
+        if let Ok(mut parser) = self.term.lock() {
+            parser.screen_mut().capture_queries(true);
+            parser.screen_mut().set_program_status_enabled(program_status);
+            parser.process(&bytes);
+            device_queries = parser.screen_mut().take_queries();
+            if !device_queries.is_empty() {
+                let mut st = DecrqmState::from_screen(parser.screen());
+                st.synchronized_output = self.sync_gate.is_open();
+                decrqm_state = Some(st);
+            }
+            if parser.screen_mut().take_audible_bell() {
+                self.bell_pending.store(true, Ordering::Release);
+            }
+            // Issue #685: mirror the low sixteen OSC 4 entries out for the
+            // server loop's colour path, which answers when an injection
+            // fails and cannot take this lock.  The generation check makes
+            // this free for every pane that never sets a palette, and near
+            // free for one that sets it once at startup the way conhost
+            // does.
+            let gen = parser.screen().palette_generation();
+            if gen != self.published_palette_gen {
+                self.published_palette_gen = gen;
+                crate::types::publish_pane_palette(self.pane_id, palette16(parser.screen()));
+            }
+        }
+        // When TUI sends RMCUP, reset cursor shape so it doesn't
+        // persist from the exiting TUI app.
+        if rmcup {
+            self.cursor_shape.store(0, Ordering::Release);
+        }
+        // Signal the main loop to inject a CPR response (ESC[row;colR).
+        // pwsh emits ESC[6n at startup and after session events such as
+        // lock/unlock; the main loop writes the response via pane.writer.
+        if has_cpr_query {
+            self.cpr_pending.store(true, Ordering::Release);
+            crate::types::CPR_DATA_PENDING.store(true, Ordering::Release);
+        }
+        self.dv_writer.fetch_add(1, Ordering::Release);
+        crate::types::PTY_DATA_READY.store(true, Ordering::Release);
+        crate::pty_trace::mark("p", self.pane_id, &bytes);
+        // Wake the server loop on the event instead of leaving it to notice
+        // the flag when its poll interval happens to expire.
+        crate::types::wake_server_loop();
+        // Answer this batch's queries in the order they were asked, with
+        // one injection.  The batch is published above first, so what it
+        // drew is not held behind the injection (2 to 4 ms, longer when an
+        // attach fails); tmux too draws a batch and queues its replies
+        // without one waiting on the other.  Anything that cannot be
+        // injected goes the way it went before (`ReplyFallback`), to the
+        // server loop, woken again for it here.  So does the console
+        // host's own first DA1, which on a pane launch is the difference
+        // between a prompt at 0.7 s and one at 3.8 s (issue #597).
+        if !device_queries.is_empty() {
+            if device_queries.len() >= vt100::MAX_PENDING_QUERIES {
+                crate::platform::mouse_inject::log_query_bound(self.pane_id, vt100::MAX_PENDING_QUERIES);
+            }
+            let st = decrqm_state.unwrap_or_default();
+            let colours = crate::types::shared_host_colors();
+            let replies = pane_replies(
+                &device_queries, &st, &colours, &mut self.console_host_da1_open,
+            );
+            if deliver_replies(self.pane_id, self.child_pid, &replies, &self.color_query_pending) {
+                crate::types::PTY_DATA_READY.store(true, Ordering::Release);
+                crate::types::wake_server_loop();
+            }
+            crate::pty_trace::mark_plain("q", self.pane_id);
+        }
+    }
+
+    /// The reader is gone and everything it read is parsed: let out what a
+    /// synchronized update still holds and leave the alternate screen.
+    fn finish(&mut self) {
+        let held = self.sync_gate.take_all();
+        if let Ok(mut parser) = self.term.lock() {
+            if !held.is_empty() {
+                parser.process(&held);
+                self.dv_writer.fetch_add(1, Ordering::Release);
+                crate::types::PTY_DATA_READY.store(true, Ordering::Release);
+            }
+            parser.screen_mut().program_status_mut().expire();
+            crate::types::PTY_DATA_READY.store(true, Ordering::Release);
+            crate::types::wake_server_loop();
+            if parser.screen().alternate_screen() {
+                parser.process(b"\x1b[?25h\x1b[?1049l");
+                self.cursor_shape.store(0, Ordering::Release);
+                self.dv_writer.fetch_add(1, Ordering::Release);
+                crate::types::PTY_DATA_READY.store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
 // TODO: The 8 Arc parameters below should be grouped into a `ReaderSignals`
 // struct the next time a new signal is added, to keep the call-site manageable.
 pub fn spawn_reader_thread(
@@ -4622,12 +4896,41 @@ pub fn spawn_reader_thread(
     /// tests/probe_run.ps1: a pwsh echo arrives as a 62 byte chunk.
     const ECHO_CHUNK_MAX: usize = 1024;
 
-    let staging: Arc<(Mutex<Vec<u8>>, Condvar)> = Arc::new((Mutex::new(Vec::with_capacity(131072)), Condvar::new()));
-    let reader_done: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    // Every query a pane asks is answered from the parser side, in the order
+    // the parser meets them (`pane_replies`), as tmux answers each one from
+    // its parser.  A DECRQM answer has to report the pane's mode state as of
+    // the bytes that carried the query, and there the state is one lock away
+    // and already up to date.  Answering there costs no latency worth having
+    // back: a probe is far under ECHO_CHUNK_MAX, so it skips the coalescing
+    // wait, and measured from the read the injection was done in 2 to 3 ms
+    // there and in the reader thread alike.  Query capture is armed per batch
+    // (`PaneParse::process`), not once: clear-history swaps a fresh
+    // `vt100::Parser` into this same mutex, and a flag set once would leave
+    // the pane unanswered for the rest of its life.
+    let feed = Arc::new(PaneFeed {
+        staging: Mutex::new(Staging { bytes: Vec::with_capacity(131072), ..Default::default() }),
+        cv: Condvar::new(),
+        parse: Mutex::new(PaneParse {
+            term: term_reader,
+            dv_writer,
+            cursor_shape,
+            bell_pending,
+            cpr_pending,
+            color_query_pending,
+            pane_id,
+            child_pid,
+            cpr_scanner: CprScanner::new(),
+            query_detector: vt100::QueryDetector::default(),
+            published_palette_gen: u64::MAX,
+            sync_gate: SyncGate::new(),
+            console_host_da1_open: true,
+        }),
+    });
+    let feed_key = crate::control_ring::key(&output_ring);
+    register_feed(&output_ring, &feed);
 
     // ── Reader thread: pure I/O, no parser lock ──
-    let staging_r = staging.clone();
-    let reader_done_r = reader_done.clone();
+    let feed_r = feed.clone();
     let output_ring_r = output_ring.clone();
     thread::spawn(move || {
         // TEST-ONLY (PSMUX_TEST_READER_DELAY_MS): hold off this reader's first
@@ -4659,24 +4962,30 @@ pub fn spawn_reader_thread(
                     crate::pty_trace::mark("r", pane_id, &local[..n]);
                     // Push raw bytes into staging (no parser lock involved).
                     // Every query in them, the colour and XTVERSION ones
-                    // included, is found and answered by the parser thread,
+                    // included, is found and answered by the parser side,
                     // in the order the queries were asked (`pane_replies`).
                     // They used to be answered here, straight off the read,
                     // while DA1, DSR and DECRQM went down the PTY from the
                     // server loop, so the two kinds raced (issue #930); one
                     // place answering them all costs nothing measurable, as
                     // the time goes on the injection itself.
-                    let (lock, cv) = &*staging_r;
-                    if let Ok(mut buf) = lock.lock() {
-                        buf.extend_from_slice(&local[..n]);
-                        cv.notify_one();
-                    }
+                    //
                     // Append raw output to ring buffer for control mode %output.
                     // This is independent of parser state and must stay live.
                     // While control clients consume it, a full ring holds
                     // this reader until the server loop takes the bytes
-                    // instead of dropping the oldest (#875).
-                    crate::control_ring::push(&output_ring_r, &local[..n]);
+                    // instead of dropping the oldest (#875). Staged and
+                    // ringed under one lock, so `hold_pane_output` finds the
+                    // two at the same byte.
+                    let full = {
+                        let mut st = feed_r.staging.lock().unwrap_or_else(|e| e.into_inner());
+                        st.bytes.extend_from_slice(&local[..n]);
+                        feed_r.cv.notify_one();
+                        crate::control_ring::append(&output_ring_r, &local[..n])
+                    };
+                    if full {
+                        crate::control_ring::wait_for_room(&output_ring_r);
+                    }
                     // Issue #440: tee raw pane output to any registered pipe-pane
                     // writer for this pane. The atomic gate keeps this a single
                     // relaxed load (no mutex) whenever nothing is being piped,
@@ -4714,77 +5023,46 @@ pub fn spawn_reader_thread(
         }
         // Signal end-of-stream and wake parser thread one last time so it
         // can drain remaining bytes and run the alt-screen cleanup.
-        reader_done_r.store(true, Ordering::Release);
-        let (_, cv) = &*staging_r;
-        cv.notify_all();
+        feed_r.staging.lock().unwrap_or_else(|e| e.into_inner()).done = true;
+        feed_r.cv.notify_all();
     });
 
     // ── Parser thread: coalesces staged bytes, processes under one lock ──
     thread::spawn(move || {
-        let mut cpr_scanner = CprScanner::new();
-        let mut query_detector = vt100::QueryDetector::default();
-        // Every query a pane asks is answered from THIS thread, in the order
-        // the parser meets them (`pane_replies`), as tmux answers each one
-        // from its parser.  A DECRQM answer has to report the pane's mode
-        // state as of the bytes that carried the query, and here the state is
-        // one lock away and already up to date.  Answering here costs no
-        // latency worth having back: a probe is far under ECHO_CHUNK_MAX, so
-        // it skips the coalescing wait, and measured from the read the
-        // injection was done in 2 to 3 ms here and in the reader thread alike.
-        // Query capture is armed per batch below, not once here: clear-history
-        // swaps a fresh `vt100::Parser` into this same mutex, and a flag set
-        // once would leave the pane unanswered for the rest of its life.
-        // Issue #685: the palette generation last mirrored into
-        // `types::PANE_PALETTES`.  A fresh parser starts at 0 with an empty
-        // palette, so a pane id reused by respawn-pane withdraws whatever the
-        // previous child published the moment its successor writes anything.
-        let mut published_palette_gen: u64 = u64::MAX;
-        // DECSET 2026: output held back between `ESC[?2026h` and `ESC[?2026l`.
-        let mut sync_gate = SyncGate::new();
-        // The first DA1 of a pane is the console host's own, answered down
-        // the PTY (`pane_replies`).
-        let mut console_host_da1_open = true;
         loop {
-            // Wait for at least one byte (or shutdown).
+            // A held synchronized update must be released on time even if
+            // the pane goes quiet; the gate below does the release.
+            let gate_due = feed.parse.lock().ok()
+                .and_then(|p| p.sync_gate.time_left(Instant::now()))
+                .map(|left| Instant::now() + left);
+            // Wait for at least one byte (or shutdown), and for no control
+            // client batch to hold the pane.
             {
-                let (lock, cv) = &*staging;
-                let mut buf = match lock.lock() {
+                let mut st = match feed.staging.lock() {
                     Ok(g) => g,
                     Err(_) => break,
                 };
-                while buf.is_empty() {
-                    if reader_done.load(Ordering::Acquire) {
-                        // Reader is gone and nothing left to drain — exit
-                        // after running alt-screen cleanup below.
-                        drop(buf);
-                        let held = sync_gate.take_all();
-                        if let Ok(mut parser) = term_reader.lock() {
-                            if !held.is_empty() {
-                                parser.process(&held);
-                                dv_writer.fetch_add(1, Ordering::Release);
-                                crate::types::PTY_DATA_READY.store(true, Ordering::Release);
+                loop {
+                    let now = Instant::now();
+                    let wait = match st.hold_left(now) {
+                        Some(left) => left,
+                        None if !st.bytes.is_empty() => break,
+                        None if gate_due.map_or(false, |d| d <= now) => break,
+                        None if st.done => {
+                            // Reader is gone and nothing left to drain — exit
+                            // after running alt-screen cleanup.
+                            drop(st);
+                            if let Ok(mut parse) = feed.parse.lock() {
+                                parse.finish();
                             }
-                            parser.screen_mut().program_status_mut().expire();
-                            crate::types::PTY_DATA_READY.store(true, Ordering::Release);
-                            crate::types::wake_server_loop();
-                            if parser.screen().alternate_screen() {
-                                parser.process(b"\x1b[?25h\x1b[?1049l");
-                                cursor_shape.store(0, Ordering::Release);
-                                dv_writer.fetch_add(1, Ordering::Release);
-                                crate::types::PTY_DATA_READY.store(true, Ordering::Release);
-                            }
+                            unregister_feed(feed_key, &feed);
+                            return;
                         }
-                        return;
-                    }
-                    // A held synchronized update must be released on time even
-                    // if the pane goes quiet; the gate below does the release.
-                    let wait = match sync_gate.time_left(Instant::now()) {
-                        Some(left) if left.is_zero() => break,
-                        Some(left) => left.min(Duration::from_millis(100)),
-                        None => Duration::from_millis(100),
+                        None => gate_due
+                            .map_or(Duration::from_millis(100), |d| d - now)
+                            .min(Duration::from_millis(100)),
                     };
-                    let res = cv.wait_timeout(buf, wait);
-                    buf = match res {
+                    st = match feed.cv.wait_timeout(st, wait) {
                         Ok((g, _)) => g,
                         Err(_) => return,
                     };
@@ -4797,10 +5075,8 @@ pub fn spawn_reader_thread(
             // are still arriving, hard-capped at 8ms total. This bridges
             // multi-chunk frames into a single atomic parser update.
             let coalesce_start = Instant::now();
-            let mut last_len: usize = {
-                let (lock, _) = &*staging;
-                lock.lock().map(|b| b.len()).unwrap_or(0)
-            };
+            let staged = || feed.staging.lock().map(|st| st.bytes.len()).unwrap_or(0);
+            let mut last_len: usize = staged();
             // A keystroke echo is tens of bytes and arrives as one chunk, so
             // there is no multi-chunk frame to bridge and nothing to tear.
             // Waiting a tick anyway cost a tick of keystroke-to-screen latency
@@ -4811,10 +5087,7 @@ pub fn spawn_reader_thread(
                 loop {
                     if coalesce_start.elapsed().as_millis() >= COALESCE_MAX_MS { break; }
                     thread::sleep(Duration::from_millis(COALESCE_TICK_MS));
-                    let cur_len = {
-                        let (lock, _) = &*staging;
-                        lock.lock().map(|b| b.len()).unwrap_or(0)
-                    };
+                    let cur_len = staged();
                     if cur_len == last_len {
                         // No new bytes arrived in the last tick — frame boundary.
                         break;
@@ -4823,110 +5096,18 @@ pub fn spawn_reader_thread(
                 }
             }
 
-            // Take the entire staged batch.
-            let bytes = {
-                let (lock, _) = &*staging;
-                match lock.lock() {
-                    Ok(mut buf) => std::mem::take(&mut *buf),
-                    Err(_) => break,
-                }
+            // Take the entire staged batch, unless a control client's batch
+            // took the pane while this one was coalescing.
+            let mut parse = match feed.parse.lock() {
+                Ok(p) => p,
+                Err(_) => break,
             };
-            // The query scanners see every byte as it arrives, BEFORE the
-            // synchronized output gate: a program that asks a question inside
-            // an open update is blocked on the answer and will not close the
-            // update first, so the gate must not sit on the question for its
-            // one second timeout (PR #781).  A query releases what is held.
-            let has_cpr_query = cpr_scanner.scan(&bytes);
-            let program_status = crate::types::PROGRAM_STATUS_ENABLED.load(Ordering::Acquire);
-            query_detector.set_program_status_enabled(program_status);
-            let has_reply_request = query_detector.scan(&bytes);
-            let flush = has_cpr_query || has_reply_request;
-            let bytes = sync_gate.feed(bytes, Instant::now(), flush);
-            if bytes.is_empty() { continue; }
-
-            // Scan for cursor shape and RMCUP on the raw batch BEFORE
-            // handing to vt100 parser (preserves prior ordering semantics).
-            if let Some(shape) = scan_cursor_shape(&bytes) {
-                cursor_shape.store(shape, Ordering::Release);
-            }
-            let rmcup = scan_rmcup(&bytes);
-            let mut device_queries = Vec::new();
-
-            // Issue #502 diagnostic: capture the exact pre-parse byte stream
-            // when PSMUX_PANE_RAW=1. Off by default, one atomic load when off.
-            crate::debug_log::pane_raw(&bytes);
-
-            // Issue #597: sampled inside the parser lock below, so a DECRQM
-            // that shares a write with the DECSET it asks about reports the
-            // post-write value, the way tmux's in-order dispatch does.
-            let mut decrqm_state: Option<DecrqmState> = None;
-            if let Ok(mut parser) = term_reader.lock() {
-                parser.screen_mut().capture_queries(true);
-                parser.screen_mut().set_program_status_enabled(program_status);
-                parser.process(&bytes);
-                device_queries = parser.screen_mut().take_queries();
-                if !device_queries.is_empty() {
-                    let mut st = DecrqmState::from_screen(parser.screen());
-                    st.synchronized_output = sync_gate.is_open();
-                    decrqm_state = Some(st);
-                }
-                if parser.screen_mut().take_audible_bell() {
-                    bell_pending.store(true, Ordering::Release);
-                }
-                // Issue #685: mirror the low sixteen OSC 4 entries out for the
-                // server loop's colour path, which answers when an injection
-                // fails and cannot take this lock.  The generation check makes
-                // this free for every pane that never sets a palette, and near
-                // free for one that sets it once at startup the way conhost
-                // does.
-                let gen = parser.screen().palette_generation();
-                if gen != published_palette_gen {
-                    published_palette_gen = gen;
-                    crate::types::publish_pane_palette(pane_id, palette16(parser.screen()));
-                }
-            }
-            // When TUI sends RMCUP, reset cursor shape so it doesn't
-            // persist from the exiting TUI app.
-            if rmcup {
-                cursor_shape.store(0, Ordering::Release);
-            }
-            // Signal the main loop to inject a CPR response (ESC[row;colR).
-            // pwsh emits ESC[6n at startup and after session events such as
-            // lock/unlock; the main loop writes the response via pane.writer.
-            if has_cpr_query {
-                cpr_pending.store(true, Ordering::Release);
-                crate::types::CPR_DATA_PENDING.store(true, Ordering::Release);
-            }
-            dv_writer.fetch_add(1, Ordering::Release);
-            crate::types::PTY_DATA_READY.store(true, Ordering::Release);
-            crate::pty_trace::mark("p", pane_id, &bytes);
-            // Wake the server loop on the event instead of leaving it to notice
-            // the flag when its poll interval happens to expire.
-            crate::types::wake_server_loop();
-            // Answer this batch's queries in the order they were asked, with
-            // one injection.  The batch is published above first, so what it
-            // drew is not held behind the injection (2 to 4 ms, longer when an
-            // attach fails); tmux too draws a batch and queues its replies
-            // without one waiting on the other.  Anything that cannot be
-            // injected goes the way it went before (`ReplyFallback`), to the
-            // server loop, woken again for it here.  So does the console
-            // host's own first DA1, which on a pane launch is the difference
-            // between a prompt at 0.7 s and one at 3.8 s (issue #597).
-            if !device_queries.is_empty() {
-                if device_queries.len() >= vt100::MAX_PENDING_QUERIES {
-                    crate::platform::mouse_inject::log_query_bound(pane_id, vt100::MAX_PENDING_QUERIES);
-                }
-                let st = decrqm_state.unwrap_or_default();
-                let colours = crate::types::shared_host_colors();
-                let replies = pane_replies(
-                    &device_queries, &st, &colours, &mut console_host_da1_open,
-                );
-                if deliver_replies(pane_id, child_pid, &replies, &color_query_pending) {
-                    crate::types::PTY_DATA_READY.store(true, Ordering::Release);
-                    crate::types::wake_server_loop();
-                }
-                crate::pty_trace::mark_plain("q", pane_id);
-            }
+            let bytes = match feed.staging.lock() {
+                Ok(mut st) if st.hold_left(Instant::now()).is_none() => std::mem::take(&mut st.bytes),
+                Ok(_) => continue,
+                Err(_) => break,
+            };
+            parse.process(bytes, false);
         }
     });
 }
@@ -4934,6 +5115,10 @@ pub fn spawn_reader_thread(
 #[cfg(test)]
 #[path = "../tests-rs/test_sync_output_gate.rs"]
 mod test_sync_output_gate;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_control_reply_barrier.rs"]
+mod test_control_reply_barrier;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue597_xtversion_reply.rs"]

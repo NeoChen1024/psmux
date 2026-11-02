@@ -306,6 +306,8 @@ pub fn format_notification(notif: &ControlNotification) -> String {
         ControlNotification::Message { text } => {
             format!("%message {}", text)
         }
+        // Not a line: the writer thread stops at it (ReplyFence::pass).
+        ControlNotification::Fence(_) => String::new(),
     }
 }
 
@@ -452,47 +454,147 @@ pub fn flush_pane_output(app: &mut AppState) {
     if all_behind {
         return;
     }
+    let now = std::time::Instant::now();
     let mut pane_outputs: Vec<(usize, Vec<u8>)> = Vec::new();
     for (pane_id, ring) in &rings {
-        let bytes = crate::control_ring::drain(ring);
-        if bytes.is_empty() {
+        // A control client's batch holds this pane at the output its replies
+        // describe (`reply_barrier`).
+        if crate::pane::pane_output_held(ring, now) {
             continue;
         }
-        for chunk in crate::control_ring::chunks(bytes) {
-            pane_outputs.push((*pane_id, chunk));
+        let bytes = crate::control_ring::drain(ring);
+        if !bytes.is_empty() {
+            pane_outputs.push((*pane_id, bytes));
         }
     }
     crate::control_ring::notify_drained();
-    if pane_outputs.is_empty() {
-        return;
+    for (pane_id, bytes) in pane_outputs {
+        queue_pane_output(app, pane_id, &bytes, now);
     }
+}
+
+/// Where a control command's reply goes in its client's stream. tmux writes
+/// a reply and the client's `%output` to one buffer in the order they
+/// happen, so a reply follows the output the command saw and precedes the
+/// output that came after it. Here a writer thread writes the
+/// notifications and the command loop writes the replies, so the server
+/// loop queues this fence where the reply belongs, and the writer stops
+/// there until the command loop has written the reply.
+#[derive(Debug, Default)]
+pub struct ReplyFence {
+    /// (the writer reached the fence, the reply is written)
+    state: std::sync::Mutex<(bool, bool)>,
+    cv: std::sync::Condvar,
+}
+
+impl ReplyFence {
+    fn lock(&self) -> std::sync::MutexGuard<'_, (bool, bool)> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Writer side: everything queued before the fence is written. Waits
+    /// for the reply, at most `limit`.
+    pub fn pass(&self, limit: std::time::Duration) {
+        let mut st = self.lock();
+        st.0 = true;
+        self.cv.notify_all();
+        let deadline = std::time::Instant::now() + limit;
+        while !st.1 {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            st = match self.cv.wait_timeout(st, deadline - now) {
+                Ok((g, _)) => g,
+                Err(e) => e.into_inner().0,
+            };
+        }
+    }
+
+    /// Nobody will write the queue up to the fence (the client is gone):
+    /// the reply need not wait for it.
+    pub fn skip(&self) {
+        self.lock().0 = true;
+        self.cv.notify_all();
+    }
+
+    /// Command loop side: wait, at most `limit`, until the writer reached
+    /// the fence. True when it did.
+    pub fn wait_reached(&self, limit: std::time::Duration) -> bool {
+        let mut st = self.lock();
+        let deadline = std::time::Instant::now() + limit;
+        while !st.0 {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            st = match self.cv.wait_timeout(st, deadline - now) {
+                Ok((g, _)) => g,
+                Err(e) => e.into_inner().0,
+            };
+        }
+        true
+    }
+
+    /// Command loop side: the reply is written (or will never be), the
+    /// writer goes on.
+    pub fn release(&self) {
+        self.lock().1 = true;
+        self.cv.notify_all();
+    }
+}
+
+/// `ControlReplyBarrier`: a control client is about to run a command that
+/// reads pane state. Every pane is parsed up to what its reader has read,
+/// that output is queued as `%output` for every control client, the panes
+/// are held there for the rest of the client's batch
+/// (`pane::hold_pane_output`), and the reply's fence is queued behind the
+/// output, so the reply describes exactly the output sent before it.
+pub fn reply_barrier(app: &AppState, client_id: u64, fence: std::sync::Arc<ReplyFence>) {
+    let now = std::time::Instant::now();
+    for (pane_id, ring) in tree_rings(app) {
+        let bytes = crate::pane::hold_pane_output(&ring, client_id, now);
+        if !bytes.is_empty() {
+            queue_pane_output(app, pane_id, &bytes, now);
+        }
+    }
+    crate::control_ring::notify_drained();
+    let queued = app.control_clients.get(&client_id)
+        .map_or(false, |c| c.notification_tx.send(ControlNotification::Fence(fence.clone())).is_ok());
+    if !queued {
+        fence.skip();
+    }
+}
+
+/// Queue one pane's drained output as `%output` for every control client.
+fn queue_pane_output(app: &AppState, pane_id: usize, bytes: &[u8], now: std::time::Instant) {
     // The client's output gate tracks how old the oldest unwritten output of
     // each pane is (tmux control_check_age): past pause-after the pane is
     // paused for that client and its backlog dropped, and a client without
     // pause-after that falls CONTROL_MAXIMUM_AGE behind is disconnected
     // (#826). The writer thread decides between %output and
     // %extended-output and measures the age.
-    let now = std::time::Instant::now();
-    for (pane_id, data) in &pane_outputs {
-        for client in app.control_clients.values_mut() {
-            if client.paused_panes.contains(pane_id) {
+    // The bytes go out as the pane wrote them (raw-byte %output, #975).
+    for data in crate::control_ring::chunks(bytes.to_vec()) {
+        for client in app.control_clients.values() {
+            if client.paused_panes.contains(&pane_id) {
                 continue;
             }
-            match client.output_gate.enqueue_sized(*pane_id, now, data.len()) {
+            match client.output_gate.enqueue_sized(pane_id, now, data.len()) {
                 GateEnqueue::Send(seq) => {
                     let sent = client.notification_tx.send(ControlNotification::PaneOutput {
-                        pane_id: *pane_id,
+                        pane_id,
                         data: data.clone(),
                         seq,
                         queued_at: now,
                     });
                     if sent.is_err() {
-                        client.output_gate.unqueue_sized(*pane_id, seq, data.len());
+                        client.output_gate.unqueue_sized(pane_id, seq, data.len());
                     }
                 }
                 GateEnqueue::Paused => {
                     // Wakes the writer, which prints the %pause.
-                    let _ = client.notification_tx.send(ControlNotification::Pause { pane_id: *pane_id });
+                    let _ = client.notification_tx.send(ControlNotification::Pause { pane_id });
                 }
                 GateEnqueue::Skip | GateEnqueue::TooFarBehind => {}
             }

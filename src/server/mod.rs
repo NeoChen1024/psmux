@@ -3513,6 +3513,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         | CtrlReq::WindowLayout(..)
                         | CtrlReq::PtyWake
                         | CtrlReq::ClientActivity(_)
+                        | CtrlReq::ControlReplyBarrier(..)
+                        | CtrlReq::ControlReplyRelease(_)
                     );
                     let mut hook_event: Option<&str> = None;
                     // Notification hooks (issue #691). `hook_event` is the ONE
@@ -4511,6 +4513,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::PtyWake => { /* the wake itself is the whole point; the
                     PTY_DATA_READY swap above already set state_dirty. */ }
+                CtrlReq::ControlReplyBarrier(client_id, fence) => {
+                    control::reply_barrier(&app, client_id, fence);
+                }
+                CtrlReq::ControlReplyRelease(client_id) => {
+                    crate::pane::release_pane_output(client_id);
+                }
                 CtrlReq::SendKey(k) => {
                     // Same as SendText above: a prompt edit owes a frame even
                     // though no cell changed.
