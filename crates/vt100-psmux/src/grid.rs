@@ -788,8 +788,17 @@ impl Grid {
             self.scroll_top = 0;
             self.scroll_bottom = self.size().rows - 1;
         }
-        self.pos.row = self.scroll_top;
-        self.pos.col = 0;
+        // DECSTBM homes the cursor: the top left of the screen, or of the
+        // scroll region while origin mode is on.
+        self.set_pos(Pos { row: 0, col: 0 });
+    }
+
+    pub fn scroll_region(&self) -> (u16, u16) {
+        (self.scroll_top, self.scroll_bottom)
+    }
+
+    pub fn origin_mode(&self) -> bool {
+        self.origin_mode
     }
 
     fn in_scroll_region(&self) -> bool {

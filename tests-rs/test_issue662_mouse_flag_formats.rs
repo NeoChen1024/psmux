@@ -330,7 +330,7 @@ fn flags_follow_the_target_pane_not_the_active_one() {
 
     // The pane on the left asked for 1003; the one on the right asked for
     // nothing.  The active pane is the quiet one, so an implementation that
-    // reads the active pane (the way `#{alternate_on}` does) answers 0 twice.
+    // reads the active pane answers 0 twice.
     let (noisy, _p1, _r1) = make_pane(PANE_ID);
     let (quiet, _p2, _r2) = make_pane(PANE_ID + 1);
     feed(&noisy, b"\x1b[?1003h");
