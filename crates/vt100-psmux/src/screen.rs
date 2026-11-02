@@ -53,6 +53,9 @@ const MODE_APPLICATION_CURSOR: u8 = 0b0000_0010;
 const MODE_HIDE_CURSOR: u8 = 0b0000_0100;
 const MODE_ALTERNATE_SCREEN: u8 = 0b0000_1000;
 const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
+const MODE_INSERT: u8 = 0b0010_0000;
+// Inverted so that a fresh screen, with no mode bits set, wraps.
+const MODE_NO_AUTOWRAP: u8 = 0b0100_0000;
 
 /// The xterm mouse handling mode currently in use.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
@@ -1000,6 +1003,36 @@ impl Screen {
     #[must_use]
     pub fn application_cursor(&self) -> bool {
         self.mode(MODE_APPLICATION_CURSOR)
+    }
+
+    /// Returns the scroll region (DECSTBM) as `(top, bottom)`, zero based
+    /// and inclusive.
+    #[must_use]
+    pub fn scroll_region(&self) -> (u16, u16) {
+        self.grid().scroll_region()
+    }
+
+    /// Returns whether origin mode (DECOM, `CSI ? 6 h`) is on.
+    #[must_use]
+    pub fn origin_mode(&self) -> bool {
+        self.grid().origin_mode()
+    }
+
+    /// Returns whether insert mode (IRM, `CSI 4 h`) has been set.
+    ///
+    /// Only the mode is recorded: text is still written in replace mode.
+    #[must_use]
+    pub fn insert_mode(&self) -> bool {
+        self.mode(MODE_INSERT)
+    }
+
+    /// Returns whether autowrap (DECAWM, `CSI ? 7 h`) is on, as it is by
+    /// default.
+    ///
+    /// Only the mode is recorded: text still wraps at the right margin.
+    #[must_use]
+    pub fn autowrap(&self) -> bool {
+        !self.mode(MODE_NO_AUTOWRAP)
     }
 
     /// Returns whether the terminal should be in hide cursor mode.
@@ -2450,6 +2483,34 @@ impl Screen {
         self.grid_mut().row_set(row - 1);
     }
 
+    // CSI h
+    pub(crate) fn sm(
+        &mut self,
+        params: &vte::Params,
+        mut unhandled: impl FnMut(&mut Self),
+    ) {
+        for param in params {
+            match param {
+                [4] => self.set_mode(MODE_INSERT),
+                _ => unhandled(self),
+            }
+        }
+    }
+
+    // CSI l
+    pub(crate) fn rm(
+        &mut self,
+        params: &vte::Params,
+        mut unhandled: impl FnMut(&mut Self),
+    ) {
+        for param in params {
+            match param {
+                [4] => self.clear_mode(MODE_INSERT),
+                _ => unhandled(self),
+            }
+        }
+    }
+
     // CSI ? h
     pub(crate) fn decset(
         &mut self,
@@ -2460,6 +2521,7 @@ impl Screen {
             match param {
                 [1] => self.set_mode(MODE_APPLICATION_CURSOR),
                 [6] => self.grid_mut().set_origin_mode(true),
+                [7] => self.clear_mode(MODE_NO_AUTOWRAP),
                 [9] => self.set_mouse_mode(MouseProtocolMode::Press),
                 [25] => self.clear_mode(MODE_HIDE_CURSOR),
                 [47] => self.enter_alternate_grid(),
@@ -2498,6 +2560,7 @@ impl Screen {
             match param {
                 [1] => self.clear_mode(MODE_APPLICATION_CURSOR),
                 [6] => self.grid_mut().set_origin_mode(false),
+                [7] => self.set_mode(MODE_NO_AUTOWRAP),
                 [9] => self.clear_mouse_mode(MouseProtocolMode::Press),
                 [25] => self.set_mode(MODE_HIDE_CURSOR),
                 [47] => {
