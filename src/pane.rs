@@ -4520,12 +4520,11 @@ impl CprScanner {
 /// bounds a batch that never ends.
 pub(crate) const OUTPUT_HOLD_MAX: Duration = Duration::from_millis(100);
 
-/// A control client's hold on a pane: until `until`, the pane's parser takes
-/// no new output and its ring is not drained, so every reply in the client's
-/// batch describes the same screen as the `%output` sent before it.
-#[derive(Clone, Copy)]
+/// The control clients holding a pane: until `until`, the pane's parser takes
+/// no new output and its ring is not drained, so every reply in their
+/// batches describes the same screen as the `%output` sent before it.
 struct OutputHold {
-    owner: u64,
+    owners: Vec<u64>,
     until: Instant,
 }
 
@@ -4539,7 +4538,7 @@ struct Staging {
 
 impl Staging {
     fn hold_left(&self, now: Instant) -> Option<Duration> {
-        self.hold.filter(|h| h.until > now).map(|h| h.until - now)
+        self.hold.as_ref().filter(|h| h.until > now).map(|h| h.until - now)
     }
 }
 
@@ -4583,9 +4582,11 @@ fn feed_for(ring: &crate::control_ring::Ring) -> Option<Arc<PaneFeed>> {
 /// barrier makes that true: everything the pane's reader has read is parsed
 /// now, the ring is drained to the same byte, and the pane is held, its
 /// parser and its `%output` stopped, until `owner`'s batch is answered
-/// (`release_pane_output`) or `OUTPUT_HOLD_MAX` passes. A pane `owner`
-/// already holds stays at its cut, so every command of one batch sees the
-/// same screen. Returns the bytes to queue as `%output` ahead of the reply.
+/// (`release_pane_output`) or `OUTPUT_HOLD_MAX` passes. A pane already held,
+/// by `owner` or by another control client, stays at its cut: that cut's
+/// `%output` is already queued for every client ahead of their fences, and a
+/// new cut would put output behind a fence whose reply already sees it.
+/// Returns the bytes to queue as `%output` ahead of the reply.
 pub(crate) fn hold_pane_output(ring: &crate::control_ring::Ring, owner: u64, now: Instant) -> Vec<u8> {
     let Some(feed) = feed_for(ring) else {
         return crate::control_ring::drain(ring);
@@ -4593,17 +4594,23 @@ pub(crate) fn hold_pane_output(ring: &crate::control_ring::Ring, owner: u64, now
     let mut parse = feed.parse.lock().unwrap_or_else(|e| e.into_inner());
     let (bytes, out) = {
         let mut st = feed.staging.lock().unwrap_or_else(|e| e.into_inner());
-        if st.hold_left(now).is_some() && st.hold.map_or(false, |h| h.owner == owner) {
+        if st.hold_left(now).is_some() {
+            if let Some(hold) = st.hold.as_mut() {
+                if !hold.owners.contains(&owner) {
+                    hold.owners.push(owner);
+                }
+            }
             return Vec::new();
         }
-        st.hold = Some(OutputHold { owner, until: now + OUTPUT_HOLD_MAX });
+        st.hold = Some(OutputHold { owners: vec![owner], until: now + OUTPUT_HOLD_MAX });
         (std::mem::take(&mut st.bytes), crate::control_ring::drain(ring))
     };
     parse.process(bytes, true);
     out
 }
 
-/// `owner`'s batch is answered: its panes parse and send output again.
+/// `owner`'s batch is answered: its panes parse and send output again once no
+/// other control client holds them.
 pub(crate) fn release_pane_output(owner: u64) {
     let feeds: Vec<Arc<PaneFeed>> = {
         let feeds = FEEDS.lock().unwrap_or_else(|e| e.into_inner());
@@ -4611,7 +4618,12 @@ pub(crate) fn release_pane_output(owner: u64) {
     };
     for feed in feeds {
         let mut st = feed.staging.lock().unwrap_or_else(|e| e.into_inner());
-        if st.hold.map_or(false, |h| h.owner == owner) {
+        let Some(hold) = st.hold.as_mut() else { continue };
+        if !hold.owners.contains(&owner) {
+            continue;
+        }
+        hold.owners.retain(|&o| o != owner);
+        if hold.owners.is_empty() {
             st.hold = None;
             feed.cv.notify_all();
         }
