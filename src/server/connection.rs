@@ -720,6 +720,34 @@ pub(crate) fn explicit_target_session(cmd: &str, raw_target: Option<&str>) -> Op
     parse_target(raw).session.filter(|s| !s.is_empty())
 }
 
+/// Does the session a control client's `has-session -t` names exist? `own`
+/// is this server's session name and `ns` its `-L` namespace. One psmux
+/// server holds one session, so any other session must be another live
+/// server of the same namespace. tmux's cmd-has-session.c is the target
+/// lookup and nothing else, so a miss is "can't find session" (cmd-find.c).
+pub(crate) fn has_session_target_exists(target: &str, ns: Option<&str>, own: &str) -> bool {
+    let target = crate::cli::strip_exact_match_prefix(target.trim());
+    let name = target.split(':').next().unwrap_or("");
+    // `:1` and the like name the current session.
+    if name.is_empty() {
+        return true;
+    }
+    let base = match name.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) {
+        Some(id) => match crate::session::resolve_session_by_id(id) {
+            Some(base) if crate::session::registry_base_in_namespace(&base, ns) => base,
+            _ => return false,
+        },
+        None => crate::session::namespaced_session_base(ns, name),
+    };
+    if base == crate::session::session_name_base(ns, own) {
+        return true;
+    }
+    !crate::session::is_warm_session(&base)
+        && crate::session::registry_case_variant(&base).is_none()
+        && std::path::Path::new(&crate::paths::port_file(&base)).exists()
+        && crate::session::registry_pid_anchor_alive(&base) != Some(false)
+}
+
 /// Commands that resolve the pane of their `-t` themselves, so the generic
 /// temporary focus leaves the pane alone, but whose pane must still exist.
 ///
@@ -8118,11 +8146,29 @@ fn dispatch_control_command(
             true
         }
         "has-session" | "has" => {
-            let (rtx, rrx) = mpsc::channel::<bool>();
-            let _ = tx.send(CtrlReq::HasSession(rtx));
-            if let Ok(exists) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(if exists { String::new() } else { "session not found".to_string() });
-            }
+            // The server always holds its own session, so only a -t naming
+            // another one can miss. That used to answer an empty success
+            // block whatever the -t said.
+            let reply = match raw_target {
+                Some(target) => {
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::SessionInfo(rtx));
+                    let own = rrx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+                    let own = own.split(':').next().unwrap_or("").trim();
+                    let ns = crate::server::server_namespace();
+                    let shown = crate::cli::strip_exact_match_prefix(target.trim());
+                    // A %pane or @window id that reached here was already
+                    // found in this session by the target check, and tmux
+                    // takes the session from it (cmd_find_get_pane/window).
+                    if shown.starts_with('%') || shown.starts_with('@') || has_session_target_exists(target, ns.as_deref(), own) {
+                        String::new()
+                    } else {
+                        format!("\u{0001}ERR\u{0001}can't find session: {}", shown.split(':').next().unwrap_or(""))
+                    }
+                }
+                None => String::new(),
+            };
+            let _ = resp_tx.send(reply);
             true
         }
         "list-clients" | "lsc" => {
@@ -9047,3 +9093,7 @@ mod tests_prompt_error_status_line;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue954_command_list_stops.rs"]
 mod tests_issue954_command_list_stops;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_control_has_session_target.rs"]
+mod tests_control_has_session_target;
