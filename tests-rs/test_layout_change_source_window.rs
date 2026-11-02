@@ -1,12 +1,17 @@
 // break-pane, join-pane and move-pane change the layout of the window the
-// pane LEAVES as well as the one it lands in, and only the current window was
-// resized afterwards. After `break-pane` (no -d) the pane left beside the
-// broken one was still 29 columns wide in a 59 column cell, PTY included,
-// until the next resize.
+// pane LEAVES as well as the one it lands in. Two things went wrong with the
+// window that was not current afterwards:
 //
-// tmux lays out both windows (cmd-break-pane.c layout_close_pane,
-// cmd-join-pane.c server_redraw_window on the source and the target). These
-// tests drive the real operations on panes backed by stub PTYs, as
+//   * Its panes kept their old size. Only the current window was resized, so
+//     after `break-pane` (no -d) the pane left beside the broken one was still
+//     29 columns wide in a 59 column cell, PTY included, until the next
+//     resize.
+//   * Control clients were not told: `%layout-change` came from the after
+//     hook, which names the current window only.
+//
+// tmux lays out and notifies both windows (cmd-break-pane.c layout_close_pane,
+// cmd-join-pane.c window-layout-changed for the source, then the target).
+// These tests drive the real operations on panes backed by stub PTYs, as
 // tests-rs/test_issue689_break_swap_pane.rs does. Registered from
 // src/window_ops.rs.
 
@@ -14,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::types::{AppState, LayoutKind, Node};
+use crate::types::{AppState, ControlNotification, LayoutKind, Node};
 use crate::window_ops::BreakPaneRequest;
 use ratatui::layout::Rect;
 
@@ -124,6 +129,33 @@ fn assert_laid_out(app: &AppState, w: usize, what: &str) -> usize {
     rects.len()
 }
 
+fn attach_control_client(app: &mut AppState) -> std::sync::mpsc::Receiver<ControlNotification> {
+    let (ntx, nrx) = std::sync::mpsc::channel();
+    app.control_clients.insert(1, crate::types::ControlClient {
+        client_id: 1,
+        cmd_counter: 0,
+        echo_enabled: false,
+        notification_tx: ntx,
+        paused_panes: Default::default(),
+        subscriptions: Default::default(),
+        subscription_values: Default::default(),
+        subscription_last_check: Default::default(),
+        output_gate: Default::default(),
+        size: None,
+        window_sizes: Default::default(),
+    });
+    nrx
+}
+
+fn layout_change_windows(rx: &std::sync::mpsc::Receiver<ControlNotification>) -> Vec<usize> {
+    rx.try_iter()
+        .filter_map(|n| match n {
+            ControlNotification::LayoutChange { window_id, .. } => Some(window_id),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn break_pane_resizes_the_panes_left_in_the_source_window() {
     let mut app = app_with_windows(&[&[1, 2, 3]]);
@@ -156,3 +188,47 @@ fn move_pane_with_detach_resizes_a_window_that_is_not_current() {
     assert_eq!(assert_laid_out(&app, 1, "moved within @1"), 3);
 }
 
+#[test]
+fn break_pane_announces_the_source_window_it_left() {
+    let mut app = app_with_windows(&[&[1, 2, 3], &[4]]);
+    let rx = attach_control_client(&mut app);
+    app.windows[0].active_path = vec![2];
+    let before = crate::control::window_layouts(&app);
+    crate::window_ops::break_pane(&mut app, &BreakPaneRequest::default()).expect("breaks");
+    crate::control::emit_other_layout_changes(&app, &before);
+
+    // @0 lost a pane. @1 is untouched, and the new current window is announced
+    // by the command's after hook and its %window-add, not here.
+    assert_eq!(layout_change_windows(&rx), vec![0]);
+}
+
+#[test]
+fn break_pane_with_detach_leaves_the_current_window_to_the_hook() {
+    let mut app = app_with_windows(&[&[1, 2, 3]]);
+    let rx = attach_control_client(&mut app);
+    let before = crate::control::window_layouts(&app);
+    let req = BreakPaneRequest { detach: true, ..Default::default() };
+    crate::window_ops::break_pane(&mut app, &req).expect("breaks");
+    crate::control::emit_other_layout_changes(&app, &before);
+
+    assert_eq!(app.active_idx, 0);
+    assert!(layout_change_windows(&rx).is_empty(), "the after hook announces @0 once");
+}
+
+#[test]
+fn join_pane_announces_the_source_window() {
+    let mut app = app_with_windows(&[&[1, 2, 3], &[4]]);
+    let rx = attach_control_client(&mut app);
+    let before = crate::control::window_layouts(&app);
+    assert!(crate::commands::join_pane_local(&mut app, Some(0), Some(2), Some(1), None, true, false, false, None));
+    crate::control::emit_other_layout_changes(&app, &before);
+
+    assert_eq!(app.active_idx, 1);
+    assert_eq!(layout_change_windows(&rx), vec![0]);
+}
+
+#[test]
+fn no_control_client_records_nothing() {
+    let app = app_with_windows(&[&[1, 2]]);
+    assert!(crate::control::window_layouts(&app).is_empty());
+}
