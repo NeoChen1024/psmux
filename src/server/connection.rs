@@ -639,6 +639,76 @@ pub(crate) fn explicit_target_session(cmd: &str, raw_target: Option<&str>) -> Op
     parse_target(raw).session.filter(|s| !s.is_empty())
 }
 
+/// Does the session a control client's `has-session -t` names exist? `own`
+/// is this server's session name and `ns` its `-L` namespace. One psmux
+/// server holds one session, so any other session must be another live
+/// server of the same namespace. tmux's cmd-has-session.c is the target
+/// lookup and nothing else, so a miss is "can't find session" (cmd-find.c).
+pub(crate) fn has_session_target_exists(target: &str, ns: Option<&str>, own: &str) -> bool {
+    let target = crate::cli::strip_exact_match_prefix(target.trim());
+    let name = target.split(':').next().unwrap_or("");
+    // `:1` and the like name the current session.
+    if name.is_empty() {
+        return true;
+    }
+    let base = match name.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) {
+        Some(id) => match crate::session::resolve_session_by_id(id) {
+            Some(base) if crate::session::registry_base_in_namespace(&base, ns) => base,
+            _ => return false,
+        },
+        None => crate::session::namespaced_session_base(ns, name),
+    };
+    if base == crate::session::session_name_base(ns, own) {
+        return true;
+    }
+    !crate::session::is_warm_session(&base)
+        && crate::session::registry_case_variant(&base).is_none()
+        && std::path::Path::new(&crate::paths::port_file(&base)).exists()
+        && crate::session::registry_pid_anchor_alive(&base) != Some(false)
+}
+
+/// A control client's set-option whose `-t` names a session that is not this
+/// server's own. The option used to be set on this session regardless, at
+/// `%end`. Another live session of the namespace runs in its own server and
+/// is refused; a name that is no session, window or pane is tmux's
+/// missing-target error (`ParsedSetOptionArgs::missing_target_error`).
+fn control_set_option_target_error(
+    tx: &mpsc::Sender<CtrlReq>,
+    parsed: &crate::cli::ParsedSetOptionArgs<'_>,
+    window_command: bool,
+) -> Option<String> {
+    let target = parsed.target?;
+    let session = parse_target(target).session?;
+    let (rtx, rrx) = mpsc::channel::<String>();
+    let _ = tx.send(CtrlReq::SessionInfo(rtx));
+    let own_line = rrx.recv_timeout(Duration::from_secs(5)).ok()?;
+    let own = own_line.split(':').next().unwrap_or("").trim();
+    let ns = crate::server::server_namespace();
+    if session == own || session == crate::session::session_name_base(ns.as_deref(), own) {
+        return None;
+    }
+    let elsewhere = has_session_target_exists(&session, ns.as_deref(), own);
+    let missing = parsed.missing_target_error(window_command);
+    if !elsewhere && missing.is_none() {
+        return None;
+    }
+    // A bare token is a pane or window of this session before it is a
+    // session (tmux cmd_find_get_pane).
+    if !crate::cli::strip_exact_match_prefix(target).contains(':') {
+        let (s, r) = mpsc::channel();
+        let kind = crate::commands::InServerTarget::Pane;
+        if tx.send(CtrlReq::ResolveTarget { kind, spec: target.to_string(), resp: s }).is_ok()
+            && matches!(r.recv_timeout(Duration::from_secs(5)), Ok(Ok(_)))
+        {
+            return None;
+        }
+    }
+    if elsewhere {
+        return Some(format!("set-option: target is in session {} (each session runs in its own psmux server)", session));
+    }
+    missing
+}
+
 /// Commands that resolve the pane of their `-t` themselves, so the generic
 /// temporary focus leaves the pane alone, but whose pane must still exist.
 ///
@@ -1659,6 +1729,26 @@ fn coalesce_send_commands(parts: Vec<String>) -> Vec<String> {
 /// before it: its keys are already written, so it only answers an empty
 /// block. The rest of the string is the command as the client sent it.
 const COALESCED_SEND_REPLY: &str = "\u{0001}COALESCED-SEND\u{0001}";
+
+/// The requests for `resize-pane -x` and `-y` (cells, or `N%` of the window),
+/// or None when neither flag is given. tmux applies both when both are given,
+/// -x first (cmd-resize-pane.c); the two routes used to read them as either
+/// or, so `-x 50 -y 10` dropped the -y. Shared by the plain CLI route and the
+/// control route.
+pub(crate) fn resize_pane_size_requests(args: &[&str]) -> Option<Vec<CtrlReq>> {
+    let mut given = false;
+    let mut reqs = Vec::new();
+    for (flag, axis) in [("-x", "x"), ("-y", "y")] {
+        let Some(val) = args.windows(2).find(|w| w[0] == flag).map(|w| w[1]) else { continue };
+        given = true;
+        if let Some(pct) = val.strip_suffix('%').and_then(|n| n.parse::<u8>().ok()) {
+            reqs.push(CtrlReq::ResizePanePercent(axis.to_string(), pct));
+        } else if let Ok(abs) = val.parse::<u16>() {
+            reqs.push(CtrlReq::ResizePaneAbsolute(axis.to_string(), abs));
+        }
+    }
+    given.then_some(reqs)
+}
 
 /// tmux's `break-pane` template when `-P` is given without `-F`
 /// (cmd-break-pane.c:29, BREAK_PANE_TEMPLATE).
@@ -2802,6 +2892,11 @@ if control_echo || control_quiet || control_noecho {
                 })
             })
             .or(ctrl_target_err);
+        if focus_err.is_none() {
+            if let Some(parsed_set) = ctrl_set_args.as_ref() {
+                focus_err = control_set_option_target_error(&tx_ctrl, parsed_set, ctrl_set_window_option);
+            }
+        }
         if focus_err.is_none() && is_focus_cmd {
             if let Some(ref s) = ctrl_target_session {
                 let spec = crate::types::TempTarget { session: Some(s.clone()), ..Default::default() };
@@ -4379,19 +4474,11 @@ match cmd {
         if args.iter().any(|a| *a == "-Z") {
             let _ = tx.send(CtrlReq::ZoomPane);
         } else
-        // Check for absolute resize (-x N or -y N), supporting both
+        // Check for absolute resize (-x N and/or -y N), supporting both
         // absolute values (e.g. "60") and percentage strings (e.g. "30%").
-        if let Some(xval) = args.windows(2).find(|w| w[0] == "-x").map(|w| w[1]) {
-            if let Some(pct) = xval.strip_suffix('%').and_then(|n| n.parse::<u8>().ok()) {
-                let _ = tx.send(CtrlReq::ResizePanePercent("x".to_string(), pct));
-            } else if let Ok(abs) = xval.parse::<u16>() {
-                let _ = tx.send(CtrlReq::ResizePaneAbsolute("x".to_string(), abs));
-            }
-        } else if let Some(yval) = args.windows(2).find(|w| w[0] == "-y").map(|w| w[1]) {
-            if let Some(pct) = yval.strip_suffix('%').and_then(|n| n.parse::<u8>().ok()) {
-                let _ = tx.send(CtrlReq::ResizePanePercent("y".to_string(), pct));
-            } else if let Ok(abs) = yval.parse::<u16>() {
-                let _ = tx.send(CtrlReq::ResizePaneAbsolute("y".to_string(), abs));
+        if let Some(reqs) = resize_pane_size_requests(&args) {
+            for req in reqs {
+                let _ = tx.send(req);
             }
         } else {
             let amount = args.iter().find(|a| a.parse::<u16>().is_ok()).and_then(|s| s.parse::<u16>().ok()).unwrap_or(1);
@@ -8045,11 +8132,26 @@ fn dispatch_control_command(
             true
         }
         "has-session" | "has" => {
-            let (rtx, rrx) = mpsc::channel::<bool>();
-            let _ = tx.send(CtrlReq::HasSession(rtx));
-            if let Ok(exists) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(if exists { String::new() } else { "session not found".to_string() });
-            }
+            // The server always holds its own session, so only a -t naming
+            // another one can miss. That used to answer an empty success
+            // block whatever the -t said.
+            let reply = match raw_target {
+                Some(target) => {
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::SessionInfo(rtx));
+                    let own = rrx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+                    let own = own.split(':').next().unwrap_or("").trim();
+                    let ns = crate::server::server_namespace();
+                    if has_session_target_exists(target, ns.as_deref(), own) {
+                        String::new()
+                    } else {
+                        let shown = crate::cli::strip_exact_match_prefix(target.trim());
+                        format!("\u{0001}ERR\u{0001}can't find session: {}", shown.split(':').next().unwrap_or(""))
+                    }
+                }
+                None => String::new(),
+            };
+            let _ = resp_tx.send(reply);
             true
         }
         "list-clients" | "lsc" => {
@@ -8129,17 +8231,9 @@ fn dispatch_control_command(
         "resize-pane" | "resizep" => {
             if args.iter().any(|a| *a == "-Z") {
                 let _ = tx.send(CtrlReq::ZoomPane);
-            } else if let Some(xval) = args.windows(2).find(|w| w[0] == "-x").map(|w| w[1]) {
-                if let Some(pct) = xval.strip_suffix('%').and_then(|n| n.parse::<u8>().ok()) {
-                    let _ = tx.send(CtrlReq::ResizePanePercent("x".to_string(), pct));
-                } else if let Ok(abs) = xval.parse::<u16>() {
-                    let _ = tx.send(CtrlReq::ResizePaneAbsolute("x".to_string(), abs));
-                }
-            } else if let Some(yval) = args.windows(2).find(|w| w[0] == "-y").map(|w| w[1]) {
-                if let Some(pct) = yval.strip_suffix('%').and_then(|n| n.parse::<u8>().ok()) {
-                    let _ = tx.send(CtrlReq::ResizePanePercent("y".to_string(), pct));
-                } else if let Ok(abs) = yval.parse::<u16>() {
-                    let _ = tx.send(CtrlReq::ResizePaneAbsolute("y".to_string(), abs));
+            } else if let Some(reqs) = resize_pane_size_requests(args) {
+                for req in reqs {
+                    let _ = tx.send(req);
                 }
             } else {
                 let amount = args.iter().filter(|a| !a.starts_with('-')).next()
@@ -8959,3 +9053,11 @@ mod tests_issue943_prompt_error_spin;
 #[cfg(test)]
 #[path = "../../tests-rs/test_prompt_error_status_line.rs"]
 mod tests_prompt_error_status_line;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_resize_pane_both_axes.rs"]
+mod tests_resize_pane_both_axes;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_control_has_session_target.rs"]
+mod tests_control_has_session_target;
