@@ -748,6 +748,48 @@ pub(crate) fn has_session_target_exists(target: &str, ns: Option<&str>, own: &st
         && crate::session::registry_pid_anchor_alive(&base) != Some(false)
 }
 
+/// A control client's set-option whose `-t` names a session that is not this
+/// server's own. The option used to be set on this session regardless, at
+/// `%end`. Another live session of the namespace runs in its own server and
+/// is refused; a name that is no session, window or pane is tmux's
+/// missing-target error (`ParsedSetOptionArgs::missing_target_error`).
+fn control_set_option_target_error(
+    tx: &mpsc::Sender<CtrlReq>,
+    parsed: &crate::cli::ParsedSetOptionArgs<'_>,
+    window_command: bool,
+) -> Option<String> {
+    let target = parsed.target?;
+    let session = parse_target(target).session?;
+    let (rtx, rrx) = mpsc::channel::<String>();
+    let _ = tx.send(CtrlReq::SessionInfo(rtx));
+    let own_line = rrx.recv_timeout(Duration::from_secs(5)).ok()?;
+    let own = own_line.split(':').next().unwrap_or("").trim();
+    let ns = crate::server::server_namespace();
+    if session == own || session == crate::session::session_name_base(ns.as_deref(), own) {
+        return None;
+    }
+    let elsewhere = has_session_target_exists(&session, ns.as_deref(), own);
+    let missing = parsed.missing_target_error(window_command);
+    if !elsewhere && missing.is_none() {
+        return None;
+    }
+    // A bare token is a pane or window of this session before it is a
+    // session (tmux cmd_find_get_pane).
+    if !crate::cli::strip_exact_match_prefix(target).contains(':') {
+        let (s, r) = mpsc::channel();
+        let kind = crate::commands::InServerTarget::Pane;
+        if tx.send(CtrlReq::ResolveTarget { kind, spec: target.to_string(), resp: s }).is_ok()
+            && matches!(r.recv_timeout(Duration::from_secs(5)), Ok(Ok(_)))
+        {
+            return None;
+        }
+    }
+    if elsewhere {
+        return Some(format!("set-option: target is in session {} (each session runs in its own psmux server)", session));
+    }
+    missing
+}
+
 /// Commands that resolve the pane of their `-t` themselves, so the generic
 /// temporary focus leaves the pane alone, but whose pane must still exist.
 ///
@@ -2865,6 +2907,11 @@ if control_echo || control_quiet || control_noecho {
                 })
             })
             .or(ctrl_target_err);
+        if focus_err.is_none() {
+            if let Some(parsed_set) = ctrl_set_args.as_ref() {
+                focus_err = control_set_option_target_error(&tx_ctrl, parsed_set, ctrl_set_window_option);
+            }
+        }
         if focus_err.is_none() && is_focus_cmd {
             if let Some(ref s) = ctrl_target_session {
                 let spec = crate::types::TempTarget { session: Some(s.clone()), ..Default::default() };
