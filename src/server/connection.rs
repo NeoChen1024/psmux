@@ -8087,10 +8087,13 @@ fn dispatch_control_command(
                     let own = rrx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
                     let own = own.split(':').next().unwrap_or("").trim();
                     let ns = crate::server::server_namespace();
-                    if has_session_target_exists(target, ns.as_deref(), own) {
+                    let shown = crate::cli::strip_exact_match_prefix(target.trim());
+                    // A %pane or @window id that reached here was already
+                    // found in this session by the target check, and tmux
+                    // takes the session from it (cmd_find_get_pane/window).
+                    if shown.starts_with('%') || shown.starts_with('@') || has_session_target_exists(target, ns.as_deref(), own) {
                         String::new()
                     } else {
-                        let shown = crate::cli::strip_exact_match_prefix(target.trim());
                         format!("\u{0001}ERR\u{0001}can't find session: {}", shown.split(':').next().unwrap_or(""))
                     }
                 }
