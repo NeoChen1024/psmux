@@ -4168,6 +4168,11 @@ pub fn break_pane(app: &mut AppState, req: &BreakPaneRequest) -> Result<BrokenPa
     if let Some(rem) = remaining {
         app.windows[src_idx].root = rem;
         app.windows[src_idx].active_path = crate::tree::first_leaf_path(&app.windows[src_idx].root);
+        // The panes left behind take the space the broken pane gave up
+        // (cmd-break-pane.c layout_close_pane). Without -d the source is no
+        // longer the current window, so the caller's resize does not reach it.
+        let area = app.windows[src_idx].area;
+        crate::tree::resize_window_panes(app, src_idx, area);
     }
     let broken_id = crate::tree::collect_pane_ids(&pane_node).first().copied();
     if let Some(bid) = broken_id {
@@ -4662,3 +4667,7 @@ mod test_issue708_respawn_history_env;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue732_copy_mouse_gutter.rs"]
 mod test_issue732_copy_mouse_gutter;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_layout_change_source_window.rs"]
+mod tests_layout_change_source_window;
