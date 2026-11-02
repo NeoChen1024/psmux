@@ -48,7 +48,7 @@ static DRAINED: Condvar = Condvar::new();
 /// woken for it even when no TUI client is watching (`wake_server_loop`).
 pub static CONTROL_CLIENTS_PRESENT: AtomicBool = AtomicBool::new(false);
 
-fn key(ring: &Ring) -> usize {
+pub(crate) fn key(ring: &Ring) -> usize {
     Arc::as_ptr(ring) as *const () as usize
 }
 
@@ -64,27 +64,35 @@ fn is_consumed(set: &Option<HashSet<usize>>, k: usize) -> bool {
 /// bytes; once it holds `RING_HIGH` this waits until the server loop drained
 /// it (or stopped consuming it, or the pane is gone).
 pub fn push(ring: &Ring, data: &[u8]) {
-    let k = key(ring);
-    let consumed = is_consumed(&consumed_set(), k);
-    {
-        let mut buf = ring.lock().unwrap_or_else(|e| e.into_inner());
-        if !consumed {
-            let space = RING_UNCONSUMED_MAX.saturating_sub(buf.len());
-            if data.len() > space {
-                let drop_count = (data.len() - space).min(buf.len());
-                buf.drain(..drop_count);
-            }
-            let skip = data.len().saturating_sub(RING_UNCONSUMED_MAX);
-            buf.extend(&data[skip..]);
-            return;
-        }
-        buf.extend(data);
-        if buf.len() < RING_HIGH {
-            return;
-        }
+    if append(ring, data) {
+        wait_for_room(ring);
     }
-    // Full: hold this pane's reader (and so its program) until the loop has
-    // taken the bytes, as tmux stops reading a pane its clients cannot take.
+}
+
+/// The first half of `push`, which never waits: true when the ring is now
+/// full and the reader has to `wait_for_room`, outside any lock it holds.
+pub fn append(ring: &Ring, data: &[u8]) -> bool {
+    let consumed = is_consumed(&consumed_set(), key(ring));
+    let mut buf = ring.lock().unwrap_or_else(|e| e.into_inner());
+    if !consumed {
+        let space = RING_UNCONSUMED_MAX.saturating_sub(buf.len());
+        if data.len() > space {
+            let drop_count = (data.len() - space).min(buf.len());
+            buf.drain(..drop_count);
+        }
+        let skip = data.len().saturating_sub(RING_UNCONSUMED_MAX);
+        buf.extend(&data[skip..]);
+        return false;
+    }
+    buf.extend(data);
+    buf.len() >= RING_HIGH
+}
+
+/// The second half of `push` for a full ring: hold this pane's reader (and so
+/// its program) until the loop has taken the bytes, as tmux stops reading a
+/// pane its clients cannot take.
+pub fn wait_for_room(ring: &Ring) {
+    let k = key(ring);
     loop {
         crate::types::PTY_DATA_READY.store(true, Ordering::Release);
         crate::types::wake_server_loop();
