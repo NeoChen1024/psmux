@@ -90,6 +90,9 @@ pub enum ControlNotification {
     PasteBufferDeleted { name: String },
     ClientSessionChanged { client: String, session_id: usize, name: String },
     Message { text: String },
+    /// Where a command's reply goes in this client's stream: the writer
+    /// stops here until the reply is written (`control::reply_barrier`).
+    Fence(Arc<crate::control::ReplyFence>),
 }
 
 /// Per-connection control mode client state.
@@ -4055,6 +4058,13 @@ pub enum CtrlReq {
     /// carries it (cfg.c:139 and :191). Wraps a `Targeted` when the command
     /// has a -t target.
     InFile(String, Box<CtrlReq>),
+    /// A control client is about to run a command that reads pane state
+    /// (capture-pane, display-message): send it the output its reply has to
+    /// follow and hold the panes until its batch is answered
+    /// (`control::reply_barrier`).
+    ControlReplyBarrier(u64, Arc<crate::control::ReplyFence>),
+    /// The control client's batch is answered: its held panes run again.
+    ControlReplyRelease(u64),
     SessionInfo(mpsc::Sender<String>),
     /// `list-sessions -F <fmt>` — render the session row using a tmux format
     /// string. Drop-in compat with iTerm2 and other CC clients that always

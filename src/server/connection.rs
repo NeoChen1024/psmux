@@ -2473,6 +2473,12 @@ if control_echo || control_quiet || control_noecho {
     let gate_notif = output_gate.clone();
     let notif_thread = std::thread::spawn(move || {
         while let Ok(notif) = notif_rx.recv() {
+            // A command's reply goes here: wait while the command loop
+            // writes it (control::reply_barrier).
+            if let ControlNotification::Fence(fence) = &notif {
+                fence.pass(Duration::from_secs(10));
+                continue;
+            }
             let is_detach = matches!(notif, ControlNotification::Detached);
             if is_detach {
                 let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -2612,23 +2618,52 @@ if control_echo || control_quiet || control_noecho {
     // sendCommandList joins many commands with "; " into one wire line and
     // expects one %begin/%end pair per sub-command.
     let mut pending: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    // A command of the batch being run read pane state, so the panes are
+    // held where its reply left them (control::reply_barrier).
+    let mut ctrl_holding = false;
+    // The client's lines, read ahead on a thread of their own, so the loop
+    // can tell whether more of a batch has come in.
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        loop {
+            match r.read_line(&mut line) {
+                Ok(0) => break, // EOF
+                // A read budget that expired is not a client that died.
+                Err(e) if is_read_retry(&e) => continue,
+                Err(_) => break,
+                Ok(_) => {
+                    if line_tx.send(std::mem::take(&mut line)).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let mut next_line: Option<String> = None;
 
     loop {
+        // The batch is answered and nothing more has come in: the held panes
+        // run again.
+        if ctrl_holding && pending.is_empty() && next_line.is_none() {
+            match line_rx.try_recv() {
+                Ok(l) => next_line = Some(l),
+                Err(_) => {
+                    let _ = tx_ctrl.send(CtrlReq::ControlReplyRelease(ctrl_client_id));
+                    ctrl_holding = false;
+                }
+            }
+        }
         let trimmed_owned: String = if let Some(s) = pending.pop_front() {
             s
         } else {
-            line.clear();
-            match r.read_line(&mut line) {
-                Ok(0) => break, // EOF
-                Err(e) => {
-                    // A read budget that expired is not a client that died.
-                    if is_read_retry(&e) {
-                        continue;
-                    }
-                    break;
-                }
-                Ok(_) => {}
-            }
+            line = match next_line.take() {
+                Some(l) => l,
+                None => match line_rx.recv() {
+                    Ok(l) => l,
+                    Err(_) => break, // EOF
+                },
+            };
 
             // Strip leading ASCII control characters (e.g., \x03 Ctrl-C) that
             // iTerm2 sends when entering tmux gateway mode. Real tmux's command
@@ -3058,6 +3093,17 @@ if control_echo || control_quiet || control_noecho {
             let _ = ws.flush();
         }
 
+        // A reply that describes pane state follows the %output that state
+        // came from and precedes any later %output, as in tmux.
+        let reply_fence = (focus_err.is_none()
+            && matches!(cmd_name, "capture-pane" | "capturep" | "display-message" | "display"))
+            .then(|| {
+                let fence = std::sync::Arc::new(control::ReplyFence::default());
+                let _ = tx_ctrl.send(CtrlReq::ControlReplyBarrier(ctrl_client_id, fence.clone()));
+                ctrl_holding = true;
+                fence
+            });
+
         // Dispatch command (use a oneshot for the response)
         let (resp_s, resp_r) = mpsc::channel::<String>();
         let response_result = if let Some(err) = focus_err {
@@ -3154,10 +3200,16 @@ if control_echo || control_quiet || control_noecho {
                 out.push('\n');
             }
         }
+        if let Some(fence) = &reply_fence {
+            fence.wait_reached(Duration::from_secs(5));
+        }
         let mut ws = write_lock.lock().unwrap();
         let _ = ws.write_all(out.as_bytes());
         let _ = ws.flush();
         drop(ws);
+        if let Some(fence) = reply_fence {
+            fence.release();
+        }
         cmd_busy.store(false, std::sync::atomic::Ordering::Release);
         // A failed command drops the rest of its line: tmux removes the
         // remaining items of the command list (cmd-queue.c cmdq_next,
@@ -3172,6 +3224,9 @@ if control_echo || control_quiet || control_noecho {
     // Deregister and clean up.
     // The CLIENT emits %exit + ST to stdout (matching real tmux's
     // client.c), so the server does not need to write ST here.
+    if ctrl_holding {
+        let _ = tx.send(CtrlReq::ControlReplyRelease(ctrl_client_id));
+    }
     let _ = tx.send(CtrlReq::ControlDeregister { client_id: ctrl_client_id });
     // The writer closes the socket once it has drained (see above); the
     // registry clone only has to go, or it leaks for the server's life.
