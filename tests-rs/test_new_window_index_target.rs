@@ -208,3 +208,25 @@ fn new_window_is_a_window_target_command() {
     assert_eq!(crate::cli::coerce_bare_window_target("neww", "3"), ":3");
     assert_eq!(crate::cli::coerce_bare_window_target("new-window", "sa"), "sa");
 }
+
+#[test]
+fn bare_target_naming_no_window_and_no_session_is_cant_find() {
+    // tmux cmd_find_get_window: not a window of the current session, not a
+    // session either, so "can't find window: nope" (cmd-find.c no_window).
+    // It used to fall back to the current session and create the window.
+    let mut app = app_from(&[(0, "w0")]);
+    let missing = "psmux-test-no-such-session-7f3a9c";
+    assert_eq!(app.plan_new_window(&place(missing), None, true).unwrap_err(), format!("can't find window: {missing}"));
+    assert_eq!(app.plan_new_window(&place(&format!("={missing}")), None, true).unwrap_err(), format!("can't find window: {missing}"));
+    assert_eq!(layout(&app), "0=w0", "nothing was created");
+}
+
+#[test]
+fn bare_target_naming_this_session_by_name_or_id() {
+    let mut app = app_from(&[(0, "w0")]);
+    app.session_id = 4;
+    run(&mut app, place("=sa"), "n").unwrap();
+    run(&mut app, place("$4"), "m").unwrap();
+    assert_eq!(layout(&app), "0=w0 1=n 2=m");
+    assert!(app.plan_new_window(&place("$5"), None, true).is_err(), "another session id");
+}
