@@ -2569,6 +2569,46 @@ pub fn compute_capture_range(s: Option<i32>, e: Option<i32>, last_row: u16) -> (
     (start, end)
 }
 
+/// Read the absolute lines `from..=to` of a capture range (0 = the top row
+/// on screen, negative = history), one screenful at a time by moving the
+/// scrollback offset, which is put back afterwards. At offset S, screen row
+/// R shows absolute line R - S.
+///
+/// Lines above the screen come from the main grid's history even while the
+/// alternate screen is up: tmux keeps the history under its alternate screen
+/// (screen_alternate_on), and `#{history_size}` counts the same lines, so
+/// `-S -#{history_size}` is the oldest of them in either case.
+fn for_each_capture_line(
+    screen: &mut vt100::Screen,
+    from: i64,
+    to: i64,
+    rows: u16,
+    mut f: impl FnMut(&vt100::Screen, u16),
+) {
+    fn walk(screen: &mut vt100::Screen, from: i64, to: i64, rows: u16, f: &mut impl FnMut(&vt100::Screen, u16)) {
+        let saved_sb = screen.scrollback();
+        let mut next_abs = from;
+        while next_abs <= to {
+            screen.set_scrollback((-next_abs).max(0) as usize);
+            let actual_sb = screen.scrollback() as i64;
+            let read_start = next_abs.max(-actual_sb);
+            let read_end = to.min(-actual_sb + rows as i64 - 1);
+            if read_start > read_end { break; }
+            for aline in read_start..=read_end {
+                f(screen, (aline + actual_sb) as u16);
+            }
+            next_abs = read_end + 1;
+        }
+        screen.set_scrollback(saved_sb);
+    }
+    if from < 0 {
+        screen.with_main_grid(|main| walk(main, from, to.min(-1), rows, &mut f));
+    }
+    if to >= 0 {
+        walk(screen, from.max(0), to, rows, &mut f);
+    }
+}
+
 pub fn capture_active_pane_range(app: &mut AppState, s: Option<i32>, e: Option<i32>, pane_id: Option<usize>, opts: impl Into<CaptureOpts>) -> io::Result<Option<String>> {
     capture_pane_range_from(app, s, e, pane_id, opts, false)
 }
@@ -2613,11 +2653,8 @@ pub fn capture_pane_range_from(app: &mut AppState, s: Option<i32>, e: Option<i32
     // Scrollback-aware capture path.
     // Absolute line numbering: 0 = top of visible (at scrollback 0),
     // negative = lines above visible top (into scrollback history).
-    // Determine actual retained scrollback depth.
-    let saved_sb = parser.screen().scrollback();
-    parser.screen_mut().set_scrollback(usize::MAX);
-    let max_sb = parser.screen().scrollback() as i64;
-    parser.screen_mut().set_scrollback(saved_sb);
+    // The retained history depth, the #{history_size} count.
+    let max_sb = parser.screen().scrollback_filled() as i64;
 
     // Resolve start: i32::MIN means "all history", other negatives are offsets
     let start_abs: i64 = match s {
@@ -2632,32 +2669,12 @@ pub fn capture_pane_range_from(app: &mut AppState, s: Option<i32>, e: Option<i32
         None => last_row as i64,
     };
 
-    if start_abs > end_abs { parser.screen_mut().set_scrollback(saved_sb); return Ok(Some(String::new())); }
+    if start_abs > end_abs { return Ok(Some(String::new())); }
 
-    // Walk scrollback in batches (same pattern as yank_selection).
-    // At scrollback offset S, screen row R shows absolute line (R - S).
-    // To read absolute line L, set scrollback so L maps to a visible row.
     let mut text = String::new();
-    let mut next_abs = start_abs;
-    while next_abs <= end_abs {
-        let target_sb = (-next_abs).max(0) as usize;
-        parser.screen_mut().set_scrollback(target_sb);
-        let actual_sb = parser.screen().scrollback() as i64;
-        let vis_start_abs = -actual_sb;
-        let vis_end_abs = -actual_sb + rows as i64 - 1;
-        let read_start = next_abs.max(vis_start_abs);
-        let read_end = end_abs.min(vis_end_abs);
-        if read_start > read_end { break; }
-
-        for aline in read_start..=read_end {
-            let r = (aline + actual_sb) as u16;
-            push_capture_line(&mut text, parser.screen(), r, cols, opts);
-        }
-        next_abs = read_end + 1;
-    }
-
-    // Restore original scrollback offset (no side effects on user view)
-    parser.screen_mut().set_scrollback(saved_sb);
+    for_each_capture_line(parser.screen_mut(), start_abs, end_abs, rows, |screen, r| {
+        push_capture_line(&mut text, screen, r, cols, opts);
+    });
     // Do NOT trim trailing blank lines here: this function is only reached
     // for an explicit -S/-E range (see connection.rs dispatch), and per the
     // sibling fast-path above (no-scrollback branch), an explicit range must
@@ -2905,10 +2922,7 @@ pub fn capture_pane_styled_from(app: &mut AppState, s: Option<i32>, e: Option<i3
     }
 
     // Scrollback-aware styled capture
-    let saved_sb = parser.screen().scrollback();
-    parser.screen_mut().set_scrollback(usize::MAX);
-    let max_sb = parser.screen().scrollback() as i64;
-    parser.screen_mut().set_scrollback(saved_sb);
+    let max_sb = parser.screen().scrollback_filled() as i64;
 
     let start_abs: i64 = match s {
         Some(v) if v == i32::MIN => -max_sb,
@@ -2921,29 +2935,12 @@ pub fn capture_pane_styled_from(app: &mut AppState, s: Option<i32>, e: Option<i3
         None => last_row as i64,
     };
 
-    if start_abs > end_abs { parser.screen_mut().set_scrollback(saved_sb); return Ok(Some(String::new())); }
+    if start_abs > end_abs { return Ok(Some(String::new())); }
 
     let mut text = String::new();
-    let mut next_abs = start_abs;
-    while next_abs <= end_abs {
-        let target_sb = (-next_abs).max(0) as usize;
-        parser.screen_mut().set_scrollback(target_sb);
-        let actual_sb = parser.screen().scrollback() as i64;
-        let vis_start_abs = -actual_sb;
-        let vis_end_abs = -actual_sb + rows as i64 - 1;
-        let read_start = next_abs.max(vis_start_abs);
-        let read_end = end_abs.min(vis_end_abs);
-        if read_start > read_end { break; }
-
-        for aline in read_start..=read_end {
-            let r = (aline + actual_sb) as u16;
-            let screen = parser.screen();
-            render_styled_row(screen, r, &mut text);
-        }
-        next_abs = read_end + 1;
-    }
-
-    parser.screen_mut().set_scrollback(saved_sb);
+    for_each_capture_line(parser.screen_mut(), start_abs, end_abs, rows, |screen, r| {
+        render_styled_row(screen, r, &mut text);
+    });
     trim_trailing_empty_styled_lines(&mut text);
     Ok(Some(text))
 }
@@ -3345,6 +3342,10 @@ mod test_issue855_copy_cursor_wide;
 #[cfg(test)]
 #[path = "../tests-rs/test_capture_pane_join.rs"]
 mod test_capture_pane_join;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_capture_alt_screen_history.rs"]
+mod test_capture_alt_screen_history;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_copy_selection_parity.rs"]
