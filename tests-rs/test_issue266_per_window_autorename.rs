@@ -136,6 +136,19 @@ fn other_window_options_still_return_global_value() {
     assert_eq!(v, "[#I:#W]", "window-status-format should mirror global");
 }
 
+/// Formats read the same per-window value: `list-windows -F '#{automatic-rename}'`
+/// tells the -n window apart from the others.
+#[test]
+fn window_format_reads_per_window_automatic_rename() {
+    let app = mock_app_with_two_windows();
+    assert_eq!(crate::format::expand_format_for_window("#{automatic-rename}", &app, 0), "off");
+    assert_eq!(crate::format::expand_format_for_window("#{automatic-rename}", &app, 1), "on");
+    assert_eq!(
+        crate::format::expand_format_for_window("#{?automatic-rename,auto,fixed}", &app, 0),
+        "fixed"
+    );
+}
+
 #[test]
 fn global_automatic_rename_off_propagates_when_no_window_override() {
     // If the user has already disabled automatic-rename globally and
