@@ -2511,6 +2511,12 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
             crate::server::options::pane_user_option(app, Some(win), target_pane(), var)
                 .unwrap_or_else(|| UNKNOWN_VAR.to_string())
         }
+        // A window option resolves for THIS window (format_find reads it through
+        // the window's options, then the global ones): `#{automatic-rename}` of
+        // a window named with -n is "off", as `show -wv -t` already says (#266).
+        _ if crate::server::options::is_window_option(var) => {
+            crate::server::options::get_window_option_value_for(app, var, Some(win_idx))
+        }
         // Anything else: try as option, then report "not a variable at all".
         _ => {
             if let Some(val) = lookup_option(var, app) { val }
