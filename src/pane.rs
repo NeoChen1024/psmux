@@ -1103,7 +1103,7 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
 pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mut AppState, command: Option<&str>, start_dir: Option<&str>, empty: bool, extra_env: &[(String, String)]) -> io::Result<()> {
     // A caller's PATH that the pane inherits anyway changes nothing (#829):
     // drop it so the warm pool below stays usable.
-    let extra_env_kept = client_path_override(extra_env, inherited_path(app).as_deref());
+    let (extra_env_kept, replay) = take_replay_file(client_path_override(extra_env, inherited_path(app).as_deref()));
     let extra_env = extra_env_kept.as_slice();
     // #607: the new window's pane becomes the active one, so hand the pane
     // that is losing focus its own copy mode back before that happens and let
@@ -1150,7 +1150,8 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
     // (see `has_custom_config` in main.rs).
     // A warm pane's shell is already running, so `-e` vars can no longer be
     // injected into its environment — bypass the transplant when -e is used.
-    let warm_eligible = command.is_none() && extra_env.is_empty() && !default_shell_needs_fresh_eval(&app.default_shell);
+    // A spare has already drawn its prompt, so a replay needs a cold spawn too.
+    let warm_eligible = command.is_none() && extra_env.is_empty() && replay.is_none() && !default_shell_needs_fresh_eval(&app.default_shell);
     // A ready spare if there is one, else the oldest warming spare, else
     // nothing and a cold spawn below. See `WarmPool::claim`.
     let (mut claimed, mut was_ready) = if warm_eligible { app.warm_pane.claim() } else { (None, false) };
@@ -1318,6 +1319,7 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
     let scrollback = app.history_limit as u32;
     let mut parser = vt100::Parser::new(size.rows, size.cols, scrollback as usize);
     parser.screen_mut().set_allow_alternate_screen(app.allow_alternate_screen);
+    if let Some(bytes) = &replay { parser.process(bytes); }
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(parser));
     let term_reader = term.clone();
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2103,6 +2105,40 @@ pub fn client_path_override(extra_env: &[(String, String)], inherited: Option<&s
         .collect()
 }
 
+/// `-e PSMUX_REPLAY_FILE=<path>` on new-window / split-window: the file's
+/// bytes are fed to the new pane's terminal before its program writes
+/// anything, so they become ordinary history above the program's output (a
+/// pane recreated after the server went away shows what it last displayed).
+/// The variable is not passed on to the program.
+pub const REPLAY_FILE_ENV: &str = "PSMUX_REPLAY_FILE";
+
+/// A replay file larger than this, or one that cannot be read, is ignored.
+pub const REPLAY_FILE_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// Splits `REPLAY_FILE_ENV` off `extra_env` and reads the file it names.
+pub fn take_replay_file(extra_env: Vec<(String, String)>) -> (Vec<(String, String)>, Option<Vec<u8>>) {
+    let mut replay = None;
+    let kept = extra_env
+        .into_iter()
+        .filter(|(k, v)| {
+            if !k.eq_ignore_ascii_case(REPLAY_FILE_ENV) {
+                return true;
+            }
+            replay = read_replay_file(v);
+            false
+        })
+        .collect();
+    (kept, replay)
+}
+
+fn read_replay_file(path: &str) -> Option<Vec<u8>> {
+    let len = std::fs::metadata(path).ok()?.len();
+    if len == 0 || len > REPLAY_FILE_LIMIT {
+        return None;
+    }
+    std::fs::read(path).ok().filter(|bytes| !bytes.is_empty())
+}
+
 /// Where a split puts its new pane: `-l` and `-b` of split-window.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SplitPlacement {
@@ -2158,7 +2194,7 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
 pub fn split_active_placed(app: &mut AppState, kind: LayoutKind, command: Option<&str>, pty_system_ref: Option<&dyn portable_pty::PtySystem>, start_dir: Option<&str>, extra_env: &[(String, String)], placement: SplitPlacement) -> io::Result<()> {
     // A caller's PATH that the pane inherits anyway changes nothing (#829):
     // drop it so the warm pool below stays usable.
-    let extra_env_kept = client_path_override(extra_env, inherited_path(app).as_deref());
+    let (extra_env_kept, replay) = take_replay_file(client_path_override(extra_env, inherited_path(app).as_deref()));
     let extra_env = extra_env_kept.as_slice();
     // #607: the split's new pane becomes the active one.  Park the copy mode
     // on the pane it was entered in first, then let the new pane adopt its
@@ -2239,7 +2275,8 @@ pub fn split_active_placed(app: &mut AppState, kind: LayoutKind, command: Option
     // instead; a static custom default-shell is safe to transplant.
     // A warm pane's shell is already running, so `-e` vars can no longer be
     // injected into its environment — bypass the transplant when -e is used.
-    let warm_eligible = command.is_none() && extra_env.is_empty() && !default_shell_needs_fresh_eval(&app.default_shell);
+    // A spare has already drawn its prompt, so a replay needs a cold spawn too.
+    let warm_eligible = command.is_none() && extra_env.is_empty() && replay.is_none() && !default_shell_needs_fresh_eval(&app.default_shell);
     // A ready spare if there is one, else the oldest warming spare, else
     // nothing and a cold spawn below. See `WarmPool::claim`.
     let (mut claimed, mut was_ready) = if warm_eligible { app.warm_pane.claim() } else { (None, false) };
@@ -2361,6 +2398,7 @@ pub fn split_active_placed(app: &mut AppState, kind: LayoutKind, command: Option
     drop(pair.slave);
     let mut parser = vt100::Parser::new(size.rows, size.cols, app.history_limit);
     parser.screen_mut().set_allow_alternate_screen(app.allow_alternate_screen);
+    if let Some(bytes) = &replay { parser.process(bytes); }
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(parser));
     let term_reader = term.clone();
     let reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
@@ -5316,6 +5354,10 @@ mod tests_issue495_direct_spawn_cwd_hook;
 #[cfg(test)]
 #[path = "../tests-rs/test_pane_writer_queue.rs"]
 mod tests_pane_writer_queue;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pane_replay_file.rs"]
+mod tests_pane_replay_file;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_psrl_history_redirect.rs"]
