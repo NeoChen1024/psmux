@@ -90,7 +90,7 @@ Notifications are asynchronous lines that psmux sends whenever something happens
 | Notification | Meaning |
 |---|---|
 | `%session-changed $<SID> <name>` | The attached session changed |
-| `%session-renamed <name>` | The current session was renamed |
+| `%session-renamed $<SID> <name>` | The current session was renamed |
 | `%session-window-changed $<SID> @<WID>` | The active window in a session changed |
 | `%sessions-changed` | A session was created or destroyed |
 

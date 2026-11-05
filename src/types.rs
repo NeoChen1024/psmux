@@ -56,7 +56,7 @@ pub enum ControlNotification {
     WindowPaneChanged { window_id: usize, pane_id: usize },
     LayoutChange { window_id: usize, layout: String, visible_layout: String, flags: String },
     SessionChanged { session_id: usize, name: String },
-    SessionRenamed { name: String },
+    SessionRenamed { session_id: usize, name: String },
     SessionWindowChanged { session_id: usize, window_id: usize },
     SessionsChanged,
     PaneModeChanged { pane_id: usize },
