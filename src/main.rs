@@ -27,6 +27,7 @@ mod pane_border;
 mod clipboard;
 mod copy_mode;
 mod grid_reader;
+mod key_base;
 mod mouse_keys;
 mod user_keys;
 mod copy_prompt;
@@ -991,6 +992,35 @@ fn main() {
     }
 }
 
+/// The session a `-t` names by name (`NAME`, `=NAME`, `NAME:...`), for the
+/// "no such session" / "can't find session" report when no server runs for
+/// it. None for an id (`%N`, `@N`, `$N`), a `window.pane` form, or no -t.
+pub(crate) fn named_target_session(target: Option<&str>) -> Option<String> {
+    let t = crate::cli::strip_exact_match_prefix(target?.trim());
+    if t.is_empty() || t.starts_with(['%', '@', '$']) {
+        return None;
+    }
+    let session = match t.find(':') {
+        Some(colon) => &t[..colon],
+        None if t.contains('.') => return None,
+        None => t,
+    };
+    let session = crate::cli::strip_exact_match_prefix(session);
+    (!session.is_empty()).then(|| session.to_string())
+}
+
+/// tmux's message for a `-t` naming no session, for the CLI commands that
+/// read it as a session: cmd-find.c's "can't find session" for list-windows,
+/// and the environment and option commands' "no such session".
+pub(crate) fn missing_session_cli_wording(cmd: &str) -> Option<&'static str> {
+    match cmd {
+        "list-windows" | "lsw" => Some("can't find session"),
+        "set-environment" | "setenv" | "show-environment" | "showenv"
+        | "show-options" | "show" | "show-option" => Some("no such session"),
+        _ => None,
+    }
+}
+
 fn process_command_index(args: &[String]) -> Option<usize> {
     let mut i = 1;
     while i < args.len() {
@@ -1639,6 +1669,15 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                 }
                 env::set_var("PSMUX_TARGET_SESSION", &port_file_base);
                 explicit_session_target = true;
+                // tmux's own error for a session command whose -t names no
+                // session, at exit 1, instead of "no server running on
+                // session '<ns>__NAME'".
+                if let Some(wording) = command_index.and_then(|i| missing_session_cli_wording(&args[i])) {
+                    if !std::path::Path::new(&crate::paths::port_file(&port_file_base)).exists() {
+                        eprintln!("psmux: {}: {}", wording, session);
+                        std::process::exit(1);
+                    }
+                }
             }
     }
     if !explicit_session_target {
@@ -3237,16 +3276,18 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                     // scripts to capture the created pane; printing the error
                     // text to stdout with exit 0 hands the caller a bogus
                     // "id" it cannot distinguish from success (psmux-resurrect
-                    // silently lost every split this way).
-                    if resp.trim_start().starts_with("ERROR") {
-                        eprint!("{}", resp);
+                    // silently lost every split this way). A refused split
+                    // answers with the same text as without -P (#1000).
+                    let head = resp.trim_start();
+                    if head.starts_with("ERROR") || head.starts_with("psmux: split-window: ") {
+                        eprint!("{}", crate::cli::split_window_error_text(&resp));
                         std::process::exit(1);
                     }
                     print!("{}", resp);
                 } else {
                     let resp = send_control_with_response(cmd_line)?;
                     if !resp.is_empty() {
-                        eprint!("{}", resp);
+                        eprint!("{}", crate::cli::split_window_error_text(&resp));
                         std::process::exit(1);
                     }
                 }
@@ -3388,6 +3429,7 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                 let mut literal = false;
                 let mut has_x = false;
                 let mut has_hex = false;
+                let mut reset = false;
                 let mut repeat: Option<String> = None;
                 let mut keys: Vec<String> = Vec::new();
                 // Getopt-style parsing: -t consumes next arg, -l/-R/-X/-H are flags
@@ -3395,7 +3437,9 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                 while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
                         "-l" => { literal = true; }
-                        "-R" => { keys.push("__RESET__".to_string()); }
+                        // A flag, reset the pane first (tmux); it used to
+                        // become a key named __RESET__ that the shell got as text.
+                        "-R" => { reset = true; }
                         "-X" => { has_x = true; }
                         "-H" => { has_hex = true; }
                         "-t" => { i += 1; } // consume target value (already handled globally)
@@ -3412,6 +3456,7 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                 if literal { cmd.push_str(" -l"); }
                 if has_x { cmd.push_str(" -X"); }
                 if has_hex { cmd.push_str(" -H"); }
+                if reset { cmd.push_str(" -R"); }
                 if let Some(n) = repeat.as_deref() {
                     cmd.push_str(&format!(" -N {}", crate::util::quote_arg_if_needed(n)));
                 }
@@ -4149,6 +4194,14 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
                         // was merely slow to accept) exits 1 without touching the
                         // registry: has-session is a predicate, not a reaper (#622).
                     }
+                }
+                // tmux says which session it could not find (cmd-find.c) for a
+                // -t that names one; with no -t its error is about the server.
+                if explicit_session_target {
+                    eprintln!(
+                        "psmux: can't find session: {}",
+                        crate::session::display_session_name(l_socket_name.as_deref(), &target)
+                    );
                 }
                 std::process::exit(1);
             }
@@ -6155,7 +6208,22 @@ fn run_main_with(argv: Vec<String>, alias_expanded: bool) -> io::Result<()> {
             }
             // lock-client / lock-server / lock-session (no-op on Windows)
             "lock-client" | "lockc" | "lock-server" | "lock" | "lock-session" | "locks" => {
-                // No-op on Windows — no terminal locking concept
+                // No-op on Windows — no terminal locking concept. A
+                // lock-session -t still names a session, which tmux finds
+                // first: one that is not running is "can't find session".
+                // The routing above consumed the -t and pointed
+                // PSMUX_TARGET_SESSION at the session it names.
+                if matches!(cmd, "lock-session" | "locks") && explicit_session_target {
+                    let base = env::var("PSMUX_TARGET_SESSION").unwrap_or_default();
+                    if !std::path::Path::new(&crate::paths::port_file(&base)).exists() {
+                        let name = match l_socket_name.as_deref() {
+                            Some(ns) => base.strip_prefix(&format!("{}__", ns)).unwrap_or(&base).to_string(),
+                            None => base.clone(),
+                        };
+                        eprintln!("can't find session: {}", name);
+                        std::process::exit(1);
+                    }
+                }
                 return Ok(());
             }
             // resize-window - Resize window

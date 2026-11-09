@@ -53,9 +53,15 @@ const MODE_APPLICATION_CURSOR: u8 = 0b0000_0010;
 const MODE_HIDE_CURSOR: u8 = 0b0000_0100;
 const MODE_ALTERNATE_SCREEN: u8 = 0b0000_1000;
 const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
-const MODE_INSERT: u8 = 0b0010_0000;
-// Inverted so that a fresh screen, with no mode bits set, wraps.
-const MODE_NO_AUTOWRAP: u8 = 0b0100_0000;
+/// DECAWM reset (`CSI ? 7 l`): no wrap at the right margin. A bit for the
+/// mode that is not the default, so a new screen and RIS wrap, as tmux's
+/// MODE_WRAP is on from the start (screen-write.c:430 at tag 3.8).
+const MODE_NO_AUTOWRAP: u8 = 0b0010_0000;
+/// IRM (`CSI 4 h`): a printed character moves the rest of the line right.
+const MODE_INSERT: u8 = 0b0100_0000;
+
+/// tmux keeps at most ten saved titles (screen.c:298 at tag 3.8).
+const TITLE_STACK_MAX: usize = 10;
 
 /// The xterm mouse handling mode currently in use.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
@@ -118,6 +124,14 @@ pub struct Screen {
     /// DECSET 1049 restored the app's colors instead of the shell's, and every
     /// line printed afterwards inherited them.
     alternate_saved_attrs: crate::attrs::Attrs,
+    /// The character sets G0 and G1 hold and the one in use (the line drawing
+    /// set, `crate::charset`). DECSC saves them with the cursor and DECRC puts
+    /// them back, one slot per screen as for the attributes, as tmux's
+    /// `input_save_state` copies the whole cell, sets included (input.c:
+    /// 849-871 at tag 3.8).
+    charsets: crate::charset::Charsets,
+    saved_charsets: crate::charset::Charsets,
+    alternate_saved_charsets: crate::charset::Charsets,
     /// Where the cursor was on the main screen when the alternate screen was
     /// entered, `None` while it is not in use (tmux's `saved_cx`/`saved_cy`,
     /// set by screen_alternate_on and reset by screen_alternate_off).
@@ -138,6 +152,16 @@ pub struct Screen {
 
     /// Window title set by the application via OSC 0 or OSC 2.
     osc_title: String,
+    /// Titles saved by `CSI 22 ; 0 t`, the newest last, at most
+    /// `TITLE_STACK_MAX` (tmux's `screen_push_title`, screen.c:292-314 at tag
+    /// 3.8, drops the oldest beyond ten).
+    title_stack: Vec<String>,
+    /// `CSI 23 ; 0 t` restored a title saved before the program set any, so
+    /// the pane's title goes back to its first one (the host name, as tmux's
+    /// `window_pane_create` gives it, window.c:1479-1480). An empty `osc_title`
+    /// alone means "no title set" to psmux, so the server needs to hear of it
+    /// once: [`take_title_reset`](Self::take_title_reset).
+    title_reset: bool,
 
     /// Path announced by the shell via OSC 7 (`\e]7;file://host/path\a`).
     /// Used as a fallback for CWD when PEB walking fails (SSH, WSL).
@@ -367,6 +391,9 @@ impl Screen {
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: crate::attrs::Attrs::default(),
             alternate_saved_attrs: crate::attrs::Attrs::default(),
+            charsets: crate::charset::Charsets::default(),
+            saved_charsets: crate::charset::Charsets::default(),
+            alternate_saved_charsets: crate::charset::Charsets::default(),
             alternate_saved_cursor: None,
 
             modes: 0,
@@ -374,6 +401,8 @@ impl Screen {
             mouse_protocol_encoding: MouseProtocolEncoding::default(),
             mouse_encoding_flags: 0,
             osc_title: String::new(),
+            title_stack: Vec::new(),
+            title_reset: false,
             osc7_path: None,
             osc94_progress: None,
             program_status: crate::ProgramStatuses::default(),
@@ -1036,23 +1065,6 @@ impl Screen {
         self.grid().origin_mode()
     }
 
-    /// Returns whether insert mode (IRM, `CSI 4 h`) has been set.
-    ///
-    /// Only the mode is recorded: text is still written in replace mode.
-    #[must_use]
-    pub fn insert_mode(&self) -> bool {
-        self.mode(MODE_INSERT)
-    }
-
-    /// Returns whether autowrap (DECAWM, `CSI ? 7 h`) is on, as it is by
-    /// default.
-    ///
-    /// Only the mode is recorded: text still wraps at the right margin.
-    #[must_use]
-    pub fn autowrap(&self) -> bool {
-        !self.mode(MODE_NO_AUTOWRAP)
-    }
-
     /// Returns whether the terminal should be in hide cursor mode.
     #[must_use]
     pub fn hide_cursor(&self) -> bool {
@@ -1063,6 +1075,18 @@ impl Screen {
     #[must_use]
     pub fn bracketed_paste(&self) -> bool {
         self.mode(MODE_BRACKETED_PASTE)
+    }
+
+    /// Whether autowrap (DECAWM, `CSI ? 7 h`) is on; it is from the start.
+    #[must_use]
+    pub fn autowrap(&self) -> bool {
+        !self.mode(MODE_NO_AUTOWRAP)
+    }
+
+    /// Whether insert mode (IRM, `CSI 4 h`) is on.
+    #[must_use]
+    pub fn insert_mode(&self) -> bool {
+        self.mode(MODE_INSERT)
     }
 
     /// Whether the output stream has asked for win32 input mode
@@ -1184,6 +1208,31 @@ impl Screen {
         if let Ok(s) = std::str::from_utf8(raw) {
             self.osc_title = s.to_string();
         }
+    }
+
+    /// `CSI 22 ; 0 t` / `CSI 22 ; 2 t`: save the title (input.c:2187-2196
+    /// at tag 3.8). At most ten are kept, and the oldest goes first.
+    pub(crate) fn push_title(&mut self) {
+        if self.title_stack.len() >= TITLE_STACK_MAX {
+            self.title_stack.remove(0);
+        }
+        self.title_stack.push(self.osc_title.clone());
+    }
+
+    /// `CSI 23 ; 0 t` / `CSI 23 ; 2 t`: restore the newest saved title, or
+    /// nothing when none is saved (input.c:2198-2209, screen.c:321-337).
+    pub(crate) fn pop_title(&mut self) {
+        if let Some(title) = self.title_stack.pop() {
+            self.title_reset = title.is_empty();
+            self.osc_title = title;
+        }
+    }
+
+    /// True once after `CSI 23 ; 0 t` restored a title saved before any was
+    /// set: the pane's title is to go back to its first one. Taking it
+    /// clears it.
+    pub fn take_title_reset(&mut self) -> bool {
+        std::mem::take(&mut self.title_reset)
     }
 
     /// Returns the path announced by the shell via OSC 7, if any.
@@ -1823,6 +1872,7 @@ impl Screen {
         // Start the alternate screen's DECSC slot clean so a value left by a
         // previous alternate-screen session cannot surface in this one.
         self.alternate_saved_attrs = crate::attrs::Attrs::default();
+        self.alternate_saved_charsets = crate::charset::Charsets::default();
     }
 
     fn exit_alternate_grid(&mut self) {
@@ -1897,18 +1947,37 @@ impl Screen {
         // the two screens cannot overwrite each other (issue #502).
         if self.mode(MODE_ALTERNATE_SCREEN) {
             self.alternate_saved_attrs = self.attrs;
+            self.alternate_saved_charsets = self.charsets;
         } else {
             self.saved_attrs = self.attrs;
+            self.saved_charsets = self.charsets;
         }
     }
 
     fn restore_cursor(&mut self) {
         self.grid_mut().restore_cursor();
-        self.attrs = if self.mode(MODE_ALTERNATE_SCREEN) {
-            self.alternate_saved_attrs
+        (self.attrs, self.charsets) = if self.mode(MODE_ALTERNATE_SCREEN) {
+            (self.alternate_saved_attrs, self.alternate_saved_charsets)
         } else {
-            self.saved_attrs
+            (self.saved_attrs, self.saved_charsets)
         };
+    }
+
+    /// `ESC ( 0` / `ESC ( B` into G0 (`g1` false), `ESC ) 0` / `ESC ) B`
+    /// into G1.
+    pub(crate) fn designate_charset(&mut self, g1: bool, line_drawing: bool) {
+        self.charsets.designate(g1, line_drawing);
+    }
+
+    /// SO (`shifted`) chooses G1, SI chooses G0.
+    pub(crate) fn shift_charset(&mut self, shifted: bool) {
+        self.charsets.shift(shifted);
+    }
+
+    /// The character a printed `c` stands for in the set in use.
+    #[inline]
+    pub(crate) fn charset_map(&self, c: char) -> char {
+        self.charsets.map(c)
     }
 
     fn set_mode(&mut self, mode: u8) {
@@ -2126,6 +2195,17 @@ impl Screen {
             return;
         }
 
+        // Autowrap off and insert mode are rare, so one test of the mode
+        // bits keeps them off the path of every other printed character.
+        let autowrap = if self.modes & (MODE_NO_AUTOWRAP | MODE_INSERT) == 0 {
+            true
+        } else {
+            match self.text_modes(width) {
+                Some(autowrap) => autowrap,
+                None => return,
+            }
+        };
+
         // it doesn't make any sense to wrap if the last column in a row
         // didn't already have contents. don't try to handle the case where a
         // character wraps because there was only one column left in the
@@ -2135,7 +2215,7 @@ impl Screen {
         // (xterm handles this by introducing the concept of triple width
         // cells, which i really don't want to do).
         let mut wrap = false;
-        if pos.col > size.cols - width {
+        if autowrap && pos.col > size.cols - width {
             let last_cell = self
                 .grid()
                 .drawing_cell(crate::grid::Pos {
@@ -2235,6 +2315,48 @@ impl Screen {
             }
             self.grid_mut().col_inc(1);
         }
+        // With no wrap the cursor stays on the last column, so the next
+        // character replaces it (screen-write.c:2790-2794 at tag 3.8).
+        if !autowrap {
+            self.text_stay_on_last_column();
+        }
+    }
+
+    /// The part of `text` for autowrap off or insert mode, before the
+    /// character is placed. `None` drops the character; otherwise whether
+    /// autowrap is on.
+    #[cold]
+    #[inline(never)]
+    fn text_modes(&mut self, width: u16) -> Option<bool> {
+        let pos = self.grid().pos();
+        let size = self.grid().size();
+        let autowrap = !self.mode(MODE_NO_AUTOWRAP);
+        // With autowrap off, a wide character that does not fit before the
+        // right margin is dropped (screen-write.c:2695-2698 at tag 3.8).
+        if !autowrap && width > 1 && pos.col != size.cols && pos.col > size.cols - width {
+            return None;
+        }
+        // Insert mode makes room for the character at the cursor before the
+        // wrap is decided, as tmux does (screen-write.c:2701-2704); what
+        // moves past the right margin is lost.
+        if self.mode(MODE_INSERT) {
+            self.grid_mut().insert_cells(width);
+        }
+        // No wrap: the character replaces the last one that fits
+        // (screen-write.c:2707 wraps only with MODE_WRAP).
+        if !autowrap && pos.col > size.cols - width {
+            self.grid_mut().col_set(size.cols - width);
+        }
+        Some(autowrap)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn text_stay_on_last_column(&mut self) {
+        let cols = self.grid().size().cols;
+        if self.grid().pos().col > cols - 1 {
+            self.grid_mut().col_set(cols - 1);
+        }
     }
 
     // control codes
@@ -2314,6 +2436,14 @@ impl Screen {
         let capture = self.capture_queries;
         let program_status_enabled = self.program_status_enabled;
         let win32_input_requested = self.win32_input_requested;
+        // The title and the saved titles stay, as in tmux, whose RIS and
+        // `send-keys -R` go through screen_write_reset, which touches neither
+        // (input.c:1407-1411 at tag 3.8; `screen_free_titles` is only in
+        // `screen_reinit`). An OSC 2 and an RIS in one burst used to lose the
+        // title, before the server had copied it to the pane.
+        let osc_title = std::mem::take(&mut self.osc_title);
+        let title_stack = std::mem::take(&mut self.title_stack);
+        let title_reset = self.title_reset;
         // RIS drops the OSC 4 entries only; the pane-colours defaults belong
         // to the pane's options, not to the program (input.c:1407 clears
         // `p->palette` and leaves `p->default_palette`).
@@ -2327,6 +2457,9 @@ impl Screen {
         self.capture_queries = capture;
         self.program_status_enabled = program_status_enabled;
         self.win32_input_requested = win32_input_requested;
+        self.osc_title = osc_title;
+        self.title_stack = title_stack;
+        self.title_reset = title_reset;
     }
 
     // csi codes
@@ -2501,34 +2634,6 @@ impl Screen {
         self.grid_mut().row_set(row - 1);
     }
 
-    // CSI h
-    pub(crate) fn sm(
-        &mut self,
-        params: &vte::Params,
-        mut unhandled: impl FnMut(&mut Self),
-    ) {
-        for param in params {
-            match param {
-                [4] => self.set_mode(MODE_INSERT),
-                _ => unhandled(self),
-            }
-        }
-    }
-
-    // CSI l
-    pub(crate) fn rm(
-        &mut self,
-        params: &vte::Params,
-        mut unhandled: impl FnMut(&mut Self),
-    ) {
-        for param in params {
-            match param {
-                [4] => self.clear_mode(MODE_INSERT),
-                _ => unhandled(self),
-            }
-        }
-    }
-
     // CSI ? h
     pub(crate) fn decset(
         &mut self,
@@ -2539,6 +2644,7 @@ impl Screen {
             match param {
                 [1] => self.set_mode(MODE_APPLICATION_CURSOR),
                 [6] => self.grid_mut().set_origin_mode(true),
+                // DECAWM (input.c:2043 at tag 3.8).
                 [7] => self.clear_mode(MODE_NO_AUTOWRAP),
                 [9] => self.set_mouse_mode(MouseProtocolMode::Press),
                 [25] => self.clear_mode(MODE_HIDE_CURSOR),
@@ -2578,6 +2684,7 @@ impl Screen {
             match param {
                 [1] => self.clear_mode(MODE_APPLICATION_CURSOR),
                 [6] => self.grid_mut().set_origin_mode(false),
+                // DECAWM (input.c:1946 at tag 3.8).
                 [7] => self.set_mode(MODE_NO_AUTOWRAP),
                 [9] => self.clear_mouse_mode(MouseProtocolMode::Press),
                 [25] => self.set_mode(MODE_HIDE_CURSOR),
@@ -2604,6 +2711,35 @@ impl Screen {
                     self.decrc();
                 }
                 [2004] => self.clear_mode(MODE_BRACKETED_PASTE),
+                _ => unhandled(self),
+            }
+        }
+    }
+
+    // CSI h: of the ANSI modes only IRM, insert mode (input.c:2007 at tag
+    // 3.8); tmux's other one, 34, is a cursor style psmux does not keep.
+    pub(crate) fn sm(
+        &mut self,
+        params: &vte::Params,
+        mut unhandled: impl FnMut(&mut Self),
+    ) {
+        for param in params {
+            match param {
+                [4] => self.set_mode(MODE_INSERT),
+                _ => unhandled(self),
+            }
+        }
+    }
+
+    // CSI l (input.c:1910 at tag 3.8).
+    pub(crate) fn rm(
+        &mut self,
+        params: &vte::Params,
+        mut unhandled: impl FnMut(&mut Self),
+    ) {
+        for param in params {
+            match param {
+                [4] => self.clear_mode(MODE_INSERT),
                 _ => unhandled(self),
             }
         }

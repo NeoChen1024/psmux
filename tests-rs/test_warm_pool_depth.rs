@@ -290,19 +290,41 @@ fn a_spare_that_lands_late_still_keeps_its_place_in_the_sequence() {
 }
 
 #[test]
-fn readiness_needs_output_then_quiet() {
+fn readiness_needs_visible_text() {
     let mut wp = fake_spare(1);
     let t0 = std::time::Instant::now();
-    // No output at all: nothing to be quiet after, so not ready however long
-    // we wait (short of the backstop).
+    // No output at all: not ready however long we wait (short of the backstop).
     assert!(!wp.refresh_ready(t0 + std::time::Duration::from_millis(600)));
-    // First byte arrives.
-    wp.data_version.store(1, std::sync::atomic::Ordering::Relaxed);
-    assert!(!wp.refresh_ready(t0 + std::time::Duration::from_millis(601)));
-    // Still writing just under the quiet window.
-    assert!(!wp.refresh_ready(t0 + std::time::Duration::from_millis(700)));
-    // Quiet for long enough: the shell has settled.
-    assert!(wp.refresh_ready(t0 + std::time::Duration::from_millis(601) + crate::types::WARM_READY_QUIET));
+    // The prompt arrives: ready at once.
+    shell_writes(&wp.data_version, &wp.term, b"PS C:\\> ");
+    assert!(wp.refresh_ready(t0 + std::time::Duration::from_millis(601)));
+    assert!(!wp.ready_via_backstop);
+}
+
+#[test]
+fn a_blank_quiet_spare_is_not_ready_issue661() {
+    // #661: a loading pwsh writes ConPTY's setup sequences, which draw
+    // nothing, and then stays silent until its prompt. On a busy machine that
+    // silence outlasted WARM_READY_QUIET and blank spares counted as ready.
+    let mut wp = fake_spare(1);
+    let t0 = wp.spawned_at;
+    shell_writes(&wp.data_version, &wp.term, b"\x1b[?25l\x1b[2J\x1b[H\x1b[?25h");
+    assert!(!wp.refresh_ready(ms(t0, 20)));
+    assert!(!wp.refresh_ready(ms(t0, 20) + crate::types::WARM_READY_QUIET), "blank and quiet is still booting");
+    assert!(!wp.refresh_ready(ms(t0, 900)), "blank and quiet is still booting");
+    assert!(!wp.shows_text);
+    shell_writes(&wp.data_version, &wp.term, b"PS C:\\> ");
+    assert!(wp.refresh_ready(ms(t0, 950)));
+    assert!(wp.shows_text && !wp.ready_via_backstop);
+}
+
+#[test]
+fn blank_spare_still_has_the_backstop_issue661() {
+    let mut wp = fake_spare(1);
+    shell_writes(&wp.data_version, &wp.term, b"\x1b[?25l\x1b[H");
+    assert!(!wp.refresh_ready(wp.spawned_at + std::time::Duration::from_millis(10)));
+    assert!(wp.refresh_ready(wp.spawned_at + crate::types::WARM_READY_MAX_WAIT));
+    assert!(wp.ready_via_backstop);
 }
 
 #[test]
@@ -318,7 +340,7 @@ fn readiness_has_a_backstop_for_a_silent_shell() {
 #[test]
 fn readiness_is_sticky() {
     let mut wp = fake_spare(1);
-    wp.data_version.store(1, std::sync::atomic::Ordering::Relaxed);
+    shell_writes(&wp.data_version, &wp.term, b"PS C:\\> ");
     let t = wp.spawned_at + std::time::Duration::from_millis(10);
     wp.refresh_ready(t);
     wp.refresh_ready(t + crate::types::WARM_READY_QUIET);
@@ -477,6 +499,7 @@ fn fake_spare(pane_id: usize) -> crate::types::WarmPane {
         last_change: now,
         trace_settled: false,
         ready_via_backstop: false,
+        shows_text: false,
         spawn_cwd: None,
         host_colors: None,
     }
@@ -487,6 +510,9 @@ fn fake_spare(pane_id: usize) -> crate::types::WarmPane {
 fn ready_spare(pane_id: usize) -> crate::types::WarmPane {
     let mut wp = fake_spare(pane_id);
     wp.ready = true;
+    // Settled: its prompt has been up for a while.
+    wp.shows_text = true;
+    wp.last_change = wp.spawned_at - std::time::Duration::from_secs(1);
     wp
 }
 

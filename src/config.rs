@@ -1525,6 +1525,17 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
             if parts[i].contains('a') { append = true; }
             i += 1;
         }
+        // set-hook is set-option in tmux: an element of an option that is no
+        // array is "not an array: NAME" and sets nothing (cmd-set-option.c
+        // :295-298).
+        if let Some(error) = parts
+            .get(i)
+            .map(|name| name.trim_matches(|c| c == '\'' || c == '"'))
+            .and_then(crate::server::option_catalog::not_an_array_error)
+        {
+            warn_config(app, error);
+            return;
+        }
         if unset {
             // set-hook -gu <hook-name>  →  remove the hook
             if i < parts.len() {
@@ -1840,6 +1851,13 @@ fn parse_set_option(app: &mut AppState, line: &str, window_command: bool) {
             window_scope && !is_global,
         )
     {
+        warn_config(app, error);
+        return;
+    }
+    // An element of an option that is no array (`status-left[x]`): "not an
+    // array: NAME" with every flag, -q included (cmd-set-option.c:295-298 at
+    // tag 3.8). It used to be kept as text under that name.
+    if let Some(error) = crate::server::option_catalog::not_an_array_error(key) {
         warn_config(app, error);
         return;
     }

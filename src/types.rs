@@ -676,6 +676,9 @@ pub struct WarmPane {
     /// Whether [WarmPane::ready] was set by the [WARM_READY_MAX_WAIT]
     /// backstop rather than by the shell going quiet. Trace and diagnostics.
     pub ready_via_backstop: bool,
+    /// Whether this spare's screen has shown any visible character yet (a
+    /// prompt, a banner). Rechecked only when its output changes.
+    pub shows_text: bool,
     /// The directory this spare's shell was STARTED in: the `cwd` handed to
     /// `CreateProcessW`, read back off the command it was built with.
     ///
@@ -859,9 +862,29 @@ impl WarmPane {
         if dv != self.last_dv {
             self.last_dv = dv;
             self.last_change = now;
+            // The reader thread parses a batch before it bumps the version, so
+            // the screen read here already holds whatever that batch drew.
+            if !self.shows_text && screen_has_text(&self.term) {
+                self.shows_text = true;
+                crate::warm_trace!(
+                    "pool: spare pane={} shows text {:.1}ms after spawn dv={}",
+                    self.pane_id,
+                    now.saturating_duration_since(self.spawned_at).as_secs_f64() * 1000.0,
+                    dv
+                );
+            }
         }
-        let quiet = now.saturating_duration_since(self.last_change);
-        if dv > 0 && quiet >= WARM_READY_QUIET {
+        // #661: a spare is ready once its screen shows something, which for
+        // pwsh is the prompt itself, drawn in one batch with nothing after it.
+        // Readiness used to be WARM_READY_QUIET of silence, and a pwsh that is
+        // still loading writes ConPTY's own setup sequences (nothing visible)
+        // and then nothing at all until its prompt: on a busy machine spares
+        // went "ready" 330 to 820 ms after spawn with a blank screen, the
+        // pool's ready count was wrong, and a split that took one waited
+        // another 150 to 780 ms for the prompt. A shell that never draws
+        // anything visible is still covered by the WARM_READY_MAX_WAIT
+        // backstop below.
+        if dv > 0 && self.shows_text {
             self.ready = true;
         } else if now.saturating_duration_since(self.spawned_at) >= WARM_READY_MAX_WAIT {
             self.ready = true;
@@ -952,8 +975,8 @@ pub const WARM_SURGE_HOLD: std::time::Duration = std::time::Duration::from_secs(
 
 /// How close together two claims have to be to count as a run.
 ///
-/// A surge needs TWO signals, not one: a claim that found nothing ready, and
-/// another claim just before it. A lone miss is not a burst, and treating it as
+/// A surge needs a RUN: a claim with another claim just before it (see
+/// [`WarmPool::note_claim`]). A lone claim is not a burst, and treating it as
 /// one has a measured cost: a cold `new-session` misses by definition (its only
 /// spare is newborn), and surging there fired eight shell spawns alongside the
 /// session's own starting shell and made startup ~100ms slower.
@@ -1069,13 +1092,18 @@ impl WarmPool {
     /// a run, and over-reacting to it costs startup time for no benefit (a cold
     /// `new-session` misses by definition).
     ///
-    /// Given a run, three things open or hold the surge open, and #661 is the
-    /// third of them:
+    /// Given a run, the second claim of it opens the surge, and every further
+    /// claim of it holds the window open (#661).
     ///
-    ///  - a MISS: the run has already outrun the idle depth.
-    ///  - a claim that took the LAST READY spare. The next claim in this run is
-    ///    then certain to miss, and a spare takes ~400ms to become useful, so
-    ///    waiting for that miss to react guarantees one slow creation per burst.
+    ///  - OPENING on the second claim, whatever the pool still holds. The
+    ///    surge used to wait for a miss or for the claim that took the last
+    ///    ready spare, which is the third claim of a run at the default depth
+    ///    of three. A spare under a surge takes 1.2 to 1.4 s to show its prompt
+    ///    on a quiet machine and longer under load, so starting the batch one
+    ///    creation later left the fourth to sixth splits of a run 250 ms apart
+    ///    on blank panes: 2 to 3 slow splits per run on a quiet machine, 3
+    ///    under load, where opening on the second claim gave 1 to 2 and 2.
+    ///    A lone creation still never surges.
     ///  - the run CONTINUING while a surge is serving it. The surge used to
     ///    decay from the last MISS, so a run the surge was serving well renewed
     ///    nothing: five seconds after the single miss that opened it,
@@ -1086,19 +1114,14 @@ impl WarmPool {
     ///    is what [`WARM_SURGE_HOLD`] always described, so the surplus still
     ///    comes back five seconds after the user stops creating panes and idle
     ///    memory is unchanged.
-    pub fn note_claim(&mut self, satisfied: bool) {
+    pub fn note_claim(&mut self, _satisfied: bool) {
         let now = std::time::Instant::now();
         let following_another = self
             .last_claim
             .map(|t| now.saturating_duration_since(t) <= WARM_BURST_WINDOW)
             .unwrap_or(false);
         self.last_claim = Some(now);
-        if !following_another {
-            return;
-        }
-        // `ready_len` here is the pool AFTER this claim took its spare: the
-        // claim sites call this straight after `claim`.
-        if !satisfied || self.ready_len() == 0 || self.is_surging() {
+        if following_another {
             self.surge_until = Some(now + WARM_SURGE_HOLD);
         }
     }
@@ -4734,6 +4757,10 @@ pub enum CtrlReq {
     SuspendClient,
     CopyModePageUp,
     ClearHistory,
+    /// `send-keys -R`: reset the target pane's terminal state as RIS does
+    /// (tmux colour_palette_clear plus input_reset(wp->ictx, 1)), sending
+    /// the program nothing.
+    ResetPaneTerminal,
     /// TEST ONLY: sleep the server loop this many milliseconds.  Sent by the
     /// hidden `debug-stall <ms>` wire command, which the connection thread
     /// accepts only when the server was started with
@@ -4908,6 +4935,12 @@ pub enum CtrlReq {
     /// path (same path as keybindings and command prompt).  Response channel
     /// carries "OK" on success or an error string.
     RunCommand(String, mpsc::Sender<String>),
+    /// Ok(true): sent to the session the line names; Ok(false): this
+    /// session's; Err: tmux's error for the target (nothing ran).
+    ForwardToOtherSession(String, mpsc::Sender<Result<bool, String>>),
+    /// The same decision without sending: Ok(None) this session's,
+    /// Ok(Some((port, key, line))) another live session's, Err tmux's error.
+    DecideOtherSession(String, mpsc::Sender<Result<Option<(u16, String, String)>, String>>),
 }
 
 /// Global flag set by PTY reader threads when new output arrives.

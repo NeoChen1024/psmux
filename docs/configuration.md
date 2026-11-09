@@ -753,6 +753,7 @@ An alias resolves from the command line (`psmux dev`), a key binding, the comman
 - `-u command-alias[N]` removes one element and the others keep their indexes; `-u command-alias` puts the default array back, as tmux does for a global option. `set -s command-alias ''` empties it.
 - `show -s command-alias` lists them as `command-alias[N] value`, and `#{command-alias}` is every element joined with a space.
 - An element can be keyed by a name instead of a number, as in tmux 3.8: `set -s command-alias[dev] 'dev=split-window -h'` keeps your alias apart from the numbered defaults. A key of digits only is a number (`[007]` is `[7]`). `show` lists the numbered elements first, then the named ones in byte order, and `-a` without an index still takes the lowest free number. Every array option takes a name the same way (`terminal-overrides[mine]`); a named `status-format` element draws no line, as the status lines are read by number.
+- Only the array options and the hooks have elements. On any other option, `@` options included, `set` refuses an index with `not an array: status-left[0]` (with `-q` too) and sets nothing, as tmux does, while `show -g 'status-left[0]'` and `#{status-left[0]}` read the option itself. An index tmux cannot read (`status-left[]`, `status-left[0]x`) is an invalid option on every option.
 
 > **Note:** the command line asks the server for an alias only when the name is not a psmux command, so an alias named after a real command (`ls`) works from a key binding or the prompt but not as `psmux ls`. A server starts with tmux's default aliases as elements 0 to 5: `split-pane=split-window`, `splitp=split-window`, `server-info=show-messages -JT`, `info=show-messages -JT`, `choose-window=choose-tree -w` and `choose-session=choose-tree -s`. A plain `set` replaces them along with the rest, so add your own aliases at an index of their own or with `-a`; `set -su command-alias` puts the defaults back.
 
@@ -1566,11 +1567,12 @@ keys (`bind -n M-User2 ...` for a terminal that sends ESC before the
 sequence). `list-keys` prints `User1000` in full, where tmux 3.8 cuts it to
 `User100`.
 
-psmux keeps a user key as a character in the private use range U+F1000 to
-U+F13E8, which Nerd Fonts also uses for its Material Design icons. A glyph from
-that range that you type, paste or pick still reaches the pane: on the console
-route always, and on the VT route while `user-keys` is empty. With `user-keys`
-set, the VT route reads such a typed glyph as the user key of the same number.
+psmux keeps the mouse keys and the user keys as characters near the end of
+Supplementary Private Use Area-B, U+10E000 to U+10F068 (the user keys from
+U+10EC80). No common icon font draws there: the Nerd Fonts icons are in the
+BMP private use area and at U+F0001 to U+F1AF0, and Apple's SF Symbols take
+U+100000 to U+1022CF. A character from that range that you type or paste runs
+the binding of the key it stands for.
 
 `show-options -s user-keys` prints one `user-keys[N] value` line per element,
 with ESC written as `\033`, a backslash doubled, and quoted as tmux quotes it

@@ -49,6 +49,18 @@ if (-not $wslAvailable) {
 Write-Info "WSL found: $wslPath"
 Write-Info "WSL distros: $($distroCheck.Trim())"
 
+# Keep the default distro running for the whole suite.  Each test kills its
+# session's WSL panes and starts new ones a few seconds later, and WSL stops an
+# idle distro about 15 s after its last process exits.  A launch that lands in
+# that teardown failed in the pane itself, without psmux in the loop: it took
+# 2 to 30 s and printed "Failed to start the systemd user session", or died at
+# once with "Error code: Wsl/Service/E_UNEXPECTED".  A dead shell ends its
+# session (remain-on-exit off), so the next check met "no server running".
+$wslKeeper = Start-Process -FilePath $wslPath -ArgumentList @('-e', 'sleep', '900') -WindowStyle Hidden -PassThru
+$warmSw = [System.Diagnostics.Stopwatch]::StartNew()
+do { $u = (& $wslPath -e uname -s 2>&1 | Out-String) } while ($u -notmatch 'Linux' -and $warmSw.ElapsedMilliseconds -lt 60000)
+Write-Info "WSL distro warm after $($warmSw.ElapsedMilliseconds) ms"
+
 $confPath = "$env:USERPROFILE\.psmux.conf"
 $confBackup = $null
 
@@ -266,13 +278,14 @@ if ($output -match "PSMUX=.+") {
     Write-Pass "WSL env var test completed (PSMUX_SESSION may require WSLENV config)"
 }
 
-# Verify the pane is really running Linux. Poll up to 45 s: WSL shuts an
-# idle distro down, and its cold start was measured at 10 s on a quiet
-# machine (0.5 s warm), longer while a sweep loads the box.
+# Verify the pane is really running Linux. Poll up to 90 s: WSL shuts an
+# idle distro down, and its cold start was measured at 10 s, later 21 s on a
+# quiet machine (0.5 s warm), and failed a 45 s window twice while a sweep
+# loaded the box; with the distro warm the same suite passes.
 & $PSMUX send-keys -t $session 'uname -s' Enter 2>&1 | Out-Null
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $output = ""
-while ($sw.ElapsedMilliseconds -lt 45000) {
+while ($sw.ElapsedMilliseconds -lt 90000) {
     $output = (& $PSMUX capture-pane -t $session -p 2>&1) | Out-String
     if ($output -match "Linux") { break }
     Start-Sleep -Milliseconds 500
@@ -399,6 +412,7 @@ Write-Host ""
 Write-Info "Cleaning up..."
 & $PSMUX kill-server 2>$null | Out-Null
 Start-Sleep -Seconds 1
+if ($wslKeeper -and -not $wslKeeper.HasExited) { Stop-Process -Id $wslKeeper.Id -Force -ErrorAction SilentlyContinue }
 
 if ($confBackup) {
     Set-Content -Path $confPath -Value $confBackup

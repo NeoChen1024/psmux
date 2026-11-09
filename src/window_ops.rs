@@ -109,6 +109,11 @@ fn pane_inner_cell(area: Rect, abs_x: u16, abs_y: u16) -> (u16, u16) {
 /// This ratio-based mapping is a "good enough" fallback for any interaction not yet
 /// handled by client-side semantic commands.
 fn map_client_coords(app: &AppState, x: u16, y: u16) -> (u16, u16) {
+    // The raw verbs carry the client's SCREEN row, but the window area the
+    // server lays panes out in starts at row 0. A status bar drawn above the
+    // window pushes every pane down by its rows, so take them off first, as
+    // the client already does for `pane-mouse` (#1012).
+    let y = window_row_from_screen(y, app.status_visible, app.status_lines, &app.status_position);
     let cid = match app.latest_client_id {
         Some(id) => id,
         None => return (x, y),
@@ -125,6 +130,18 @@ fn map_client_coords(app: &AppState, x: u16, y: u16) -> (u16, u16) {
     let mx = if cw > 0 { ((x as u32) * (ew as u32) / (cw as u32)) as u16 } else { x };
     let my = if ch > 0 { ((y as u32) * (eh as u32) / (ch as u32)) as u16 } else { y };
     (mx.min(ew.saturating_sub(1)), my.min(eh.saturating_sub(1)))
+}
+
+/// Client screen row to window row: with `status-position top` the status
+/// rows sit above the window, so they are subtracted. A row on the status bar
+/// itself floors at the window's first row; the client handles status clicks
+/// before any raw verb is sent.
+pub(crate) fn window_row_from_screen(y: u16, status_visible: bool, status_lines: usize, status_position: &str) -> u16 {
+    if status_position == "top" {
+        y.saturating_sub(crate::client::status_rows_reserved(status_visible, status_lines))
+    } else {
+        y
+    }
 }
 
 /// Write a mouse event to the child PTY using the encoding the child requested.
@@ -4252,6 +4269,21 @@ pub fn break_pane_to_window(app: &mut AppState) {
 /// mode gone. That ordering is load bearing: while copy mode is up `pane.term`
 /// is the frozen snapshot, so clearing it would wipe the screen the user is
 /// reading and leave the live scrollback untouched.
+/// `send-keys -R` (tmux cmd-send-keys.c: colour_palette_clear and
+/// input_reset(wp->ictx, 1)): the pane's terminal state goes back to what a
+/// new program starts with, the screen is cleared and the program is sent
+/// nothing. That is what RIS does to psmux's parser, including the OSC 4
+/// palette and keeping the pane-colours defaults, so the reset is an RIS fed
+/// to the parser only; the history stays, as in tmux.
+pub fn reset_active_pane_terminal(app: &mut AppState) {
+    let win = &mut app.windows[app.active_idx];
+    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+        if let Ok(mut parser) = p.term.lock() {
+            parser.process(&[0x1b, b'c']); // RIS
+        }
+    }
+}
+
 pub fn clear_active_pane_history(app: &mut AppState) {
     if app.mode.in_copy() {
         exit_copy_mode(app);
@@ -4655,6 +4687,10 @@ mod test_issue657_wheel_nonshell_full_screen;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue669_border_status_mouse_rows.rs"]
 mod test_issue669_border_status_mouse_rows;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue1012_mouse_status_top.rs"]
+mod test_issue1012_mouse_status_top;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue689_break_swap_pane.rs"]

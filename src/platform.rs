@@ -1218,10 +1218,11 @@ impl Drop for RawVtConsole {
 /// server, so the bit is cleared once at server startup, before any pane, warm
 /// spare or child server is spawned, so all of them are born able to hear it.
 ///
-/// The server's own protection against the broadcasts it relays does not depend
-/// on this bit: `install_console_ctrl_handler` returns TRUE for CTRL_C_EVENT,
-/// and `send_ctrl_c_event` re-raises the bit for the duration of each broadcast
-/// and clears it again afterwards.
+/// The server's own protection against the events it meets on pane consoles is
+/// a handler, `mouse_inject::survive_ctrl_c_while_attached`.  A console change
+/// empties the handler list, so `free_and_attach` and `detach_console` hold this
+/// bit across each change, only until the handler is back, and clear it again,
+/// and `send_ctrl_c_event` raises it around each broadcast.
 #[cfg(windows)]
 pub fn clear_inherited_ctrl_c_ignore() {
     type HandlerRoutine = unsafe extern "system" fn(u32) -> i32;
@@ -1471,6 +1472,25 @@ pub mod mouse_inject {
             handler: Option<unsafe extern "system" fn(u32) -> i32>,
             add: i32,
         ) -> i32;
+        fn SetStdHandle(std_handle: u32, handle: *mut c_void) -> i32;
+    }
+
+    /// Issue #1000.  The server stays detached after an injection, but its std
+    /// handles still name the console it just left (its own hidden console from
+    /// `spawn_server_hidden`, or the pane's).  A write to such a handle fails
+    /// with err 87 or 5, and `eprintln!` panics on any failure except an
+    /// invalid handle, so the next error line the server printed (a refused
+    /// `split-window -P`) took the server and every pane down.  Null them, which
+    /// is the state a server started with `-d` has from birth: Rust drops a
+    /// write to a null std handle as a success, and a ConPTY spawn inherits no
+    /// freed console handle (#450).
+    unsafe fn forget_console_std_handles() {
+        const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+        const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+        const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+        for h in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            SetStdHandle(h, std::ptr::null_mut());
+        }
     }
 
     /// Console input mode flags
@@ -1743,38 +1763,65 @@ pub mod mouse_inject {
         // conhost dispatches on its own schedule.  When it lands while we are
         // attached, the server ran its default handler and exited with
         // 0xC000013A, taking every session with it.  The startup handler from
-        // `install_console_ctrl_handler` does not help: measured, a handler
-        // registered before AttachConsole (even between FreeConsole and
-        // AttachConsole) is not called for the new console, and the process
-        // dies; one registered after AttachConsole is called and it survives.
-        // So: hold the "ignore Ctrl+C" bit across the attach itself (it does
-        // survive AttachConsole, measured), register the survival handler once
-        // attached, then drop the bit again.  The bit is inherited by child
-        // processes, so it is held only for this one call; ConPTY spawns are
-        // excluded by the console lock every caller holds, and the server's
-        // bit is known to be clear here (`clear_inherited_ctrl_c_ignore` ran at
-        // startup), which is what restoring it to clear relies on.
+        // `install_console_ctrl_handler` does not help: FreeConsole and
+        // AttachConsole each empty the handler list (measured: afterwards, even
+        // after an AttachConsole that failed, SetConsoleCtrlHandler(h, FALSE)
+        // no longer finds h), so only a handler registered after the change is
+        // called.  So: hold the "ignore Ctrl+C" bit across the attach itself
+        // (it does survive AttachConsole, measured), register the survival
+        // handler, then drop the bit again.  `detach_console` does the same
+        // for the way out.  The bit is inherited by child processes, so it is
+        // held only for this one call.  ConPTY spawns are excluded by the
+        // console lock every caller holds; other spawns (run-shell, hooks) are
+        // not, and one that lands in this short window starts with Ctrl+C
+        // ignored (measured: 3 in 1,000 under constant Ctrl+C).  The server's
+        // bit is known to be clear here (`clear_inherited_ctrl_c_ignore` ran
+        // at startup), which is what restoring it to clear relies on.
         let server = SERVER_PROCESS.load(std::sync::atomic::Ordering::Relaxed);
         if server {
             SetConsoleCtrlHandler(None, 1);
         }
         let attached = free_and_attach_unguarded(child_pid, site);
-        if attached {
-            // Remove first so the list never holds more than one copy, in case
-            // a later Windows keeps handlers across AttachConsole.
+        // In the server, even when the attach failed: that empties the list
+        // too.  Remove first so the list never holds more than one copy, in
+        // case a later Windows keeps handlers across AttachConsole.
+        if attached || server {
             SetConsoleCtrlHandler(Some(survive_ctrl_c_while_attached), 0);
             SetConsoleCtrlHandler(Some(survive_ctrl_c_while_attached), 1);
         }
         if server {
             SetConsoleCtrlHandler(None, 0);
+            // A failed attach leaves the server detached with nothing to undo.
+            if !attached { forget_console_std_handles(); }
         }
         attached
     }
 
-    /// The handler `free_and_attach` registers on every attach (issue #989).
-    /// Ctrl+C and Ctrl+Break on a pane console belong to the pane's programs,
-    /// never to the psmux process that is briefly attached to it.  Close,
-    /// logoff and shutdown keep their default handling.
+    /// Leave the pane's console (issue #989).  FreeConsole empties the handler
+    /// list, and dispatch is asynchronous, so a CTRL_C_EVENT sent while the
+    /// server was attached can reach it at or just after the detach.  With
+    /// neither handler nor bit that ends it with 0xC000013A: measured with the
+    /// stock Git Bash prompt and repeated Ctrl+C, 5 of 30 runs of 300 presses
+    /// died before this, 0 of 30 after.  As in `free_and_attach`: hold the bit
+    /// across the change and restore the handler before dropping it.
+    unsafe fn detach_console() {
+        if !SERVER_PROCESS.load(std::sync::atomic::Ordering::Relaxed) {
+            FreeConsole();
+            return;
+        }
+        SetConsoleCtrlHandler(None, 1);
+        FreeConsole();
+        SetConsoleCtrlHandler(Some(survive_ctrl_c_while_attached), 0);
+        SetConsoleCtrlHandler(Some(survive_ctrl_c_while_attached), 1);
+        SetConsoleCtrlHandler(None, 0);
+        forget_console_std_handles();
+    }
+
+    /// The handler `free_and_attach` registers on every attach, and
+    /// `detach_console` on every detach in the server (issue #989).  Ctrl+C and
+    /// Ctrl+Break on a pane console belong to the pane's programs, never to the
+    /// psmux process that is briefly attached to it.  Close, logoff and
+    /// shutdown keep their default handling.
     pub(crate) unsafe extern "system" fn survive_ctrl_c_while_attached(ctrl_type: u32) -> i32 {
         match ctrl_type {
             0 | 1 => 1, // CTRL_C_EVENT | CTRL_BREAK_EVENT: handled, keep running
@@ -1881,7 +1928,7 @@ pub mod mouse_inject {
 
             if handle == INVALID_HANDLE || handle == 0 {
                 debug_log("query_vti_enabled: CreateFileW(CONIN$) FAILED");
-                FreeConsole();
+                detach_console();
                 if had_console { reattach_parent_console(); }
                 return None;
             }
@@ -1894,7 +1941,7 @@ pub mod mouse_inject {
             let ok = GetConsoleMode(handle as *mut c_void, &mut mode);
 
             CloseHandle(handle);
-            FreeConsole();
+            detach_console();
             if had_console { reattach_parent_console(); }
 
             if ok == 0 {
@@ -1950,7 +1997,7 @@ pub mod mouse_inject {
 
             if handle == INVALID_HANDLE || handle == 0 {
                 debug_log("ensure_vti_enabled: CreateFileW(CONIN$) FAILED");
-                FreeConsole();
+                detach_console();
                 if had_console { reattach_parent_console(); }
                 return false;
             }
@@ -1974,7 +2021,7 @@ pub mod mouse_inject {
             }
 
             CloseHandle(handle);
-            FreeConsole();
+            detach_console();
             if had_console { reattach_parent_console(); }
 
             ok
@@ -2041,7 +2088,7 @@ pub mod mouse_inject {
             if handle == INVALID_HANDLE || handle == 0 {
                 let err = GetLastError();
                 debug_log(&format!("send_mouse_event: CreateFileW(CONIN$) FAILED err={}", err));
-                FreeConsole();
+                detach_console();
                 if had_console { reattach_parent_console(); }
                 return false;
             }
@@ -2089,7 +2136,7 @@ pub mod mouse_inject {
 
             // Clean up: close handle, detach from child's console
             CloseHandle(handle);
-            FreeConsole();
+            detach_console();
             // Only re-attach if we had our own console (app/standalone mode)
             // Server mode: leave detached to avoid conhost cycling
             if had_console {
@@ -2146,7 +2193,7 @@ pub mod mouse_inject {
 
             if handle == INVALID_HANDLE || handle == 0 {
                 debug_log("query_console_input_mode: CreateFileW(CONIN$) FAILED");
-                FreeConsole();
+                detach_console();
                 if had_console { reattach_parent_console(); }
                 return None;
             }
@@ -2159,7 +2206,7 @@ pub mod mouse_inject {
             let ok = GetConsoleMode(handle as *mut c_void, &mut mode);
 
             CloseHandle(handle);
-            FreeConsole();
+            detach_console();
             if had_console { reattach_parent_console(); }
 
             if ok == 0 {
@@ -2209,7 +2256,7 @@ pub mod mouse_inject {
             );
 
             if handle == INVALID_HANDLE || handle == 0 {
-                FreeConsole();
+                detach_console();
                 if had_console { reattach_parent_console(); }
                 return false;
             }
@@ -2313,7 +2360,7 @@ pub mod mouse_inject {
             }
 
             CloseHandle(handle);
-            FreeConsole();
+            detach_console();
             if had_console {
                 reattach_parent_console();
             }
@@ -2388,7 +2435,7 @@ pub mod mouse_inject {
             if handle == INVALID_HANDLE || handle == 0 {
                 let err = GetLastError();
                 debug_log(&format!("send_vt_response: CreateFileW(CONIN$) FAILED err={}", err));
-                FreeConsole();
+                detach_console();
                 if had_console { reattach_parent_console(); }
                 return false;
             }
@@ -2409,7 +2456,7 @@ pub mod mouse_inject {
                         child_pid, mode, text.len()
                     ));
                     CloseHandle(handle);
-                    FreeConsole();
+                    detach_console();
                     if had_console { reattach_parent_console(); }
                     return false;
                 }
@@ -2522,7 +2569,7 @@ pub mod mouse_inject {
                 child_pid, text.len(), records.len(), offset, last_result != 0));
 
             CloseHandle(handle);
-            FreeConsole();
+            detach_console();
             if had_console {
                 reattach_parent_console();
             }
@@ -2635,7 +2682,7 @@ pub mod mouse_inject {
                     }
                     CloseHandle(handle);
                 }
-                FreeConsole();
+                detach_console();
                 if had_console { reattach_parent_console(); }
                 result
             }
@@ -2732,6 +2779,9 @@ pub mod mouse_inject {
         // established interrupt behavior (#338 line-cancel, #346 ping).  This
         // process-tree walk does not touch our console, so it is done before
         // the FreeConsole/AttachConsole dance below.
+        // One fresh process table for this whole decision; every
+        // classifier below reads it instead of walking the system again.
+        let _pinned = crate::platform::process_info::pin_fresh();
         let fg_is_shell = crate::platform::process_info::foreground_is_shell(child_pid)
             .unwrap_or(true);
 
@@ -2783,9 +2833,10 @@ pub mod mouse_inject {
                 // stripping the flag then silences its interrupt (measured).
                 let mut pids = [0u32; 64];
                 let n = GetConsoleProcessList(pids.as_mut_ptr(), 64) as usize;
+                crate::platform::process_info::repin_unless_known(&pids[..n.min(64)]);
                 if n > 0 && crate::platform::process_info::console_has_plain_native_app(&pids[..n.min(64)]) {
                     log("plain native app on pane console: keep PROCESSED_INPUT so its interrupt still fires");
-                    FreeConsole();
+                    detach_console();
                     if had_console { reattach_parent_console(); }
                     return;
                 }
@@ -2812,7 +2863,7 @@ pub mod mouse_inject {
                     }
                     CloseHandle(handle);
                 }
-                FreeConsole();
+                detach_console();
                 if had_console { reattach_parent_console(); }
             }
         }
@@ -2914,6 +2965,7 @@ pub mod mouse_inject {
                 console_pids.resize(n as usize, 0);
                 n = GetConsoleProcessList(console_pids.as_mut_ptr(), console_pids.len() as u32);
             }
+            crate::platform::process_info::repin_unless_known(&console_pids[..(n as usize).min(console_pids.len())]);
             {
                 let members: Vec<String> = console_pids[..(n as usize).min(console_pids.len())].iter()
                     .map(|p| crate::platform::process_info::classify_console_member(*p))
@@ -2954,7 +3006,7 @@ pub mod mouse_inject {
                         CloseHandle(h);
                     }
                 }
-                FreeConsole();
+                detach_console();
                 if had_console { reattach_parent_console(); }
                 return false;
             }
@@ -2994,7 +3046,7 @@ pub mod mouse_inject {
                     "foreground leaf pid={:?} is not on the pane console (root={}): a non-shell app hosts its own terminal, deliver raw 0x03 only, skip CTRL_C_EVENT broadcast",
                     fg_leaf_pid, child_pid
                 ));
-                FreeConsole();
+                detach_console();
                 if had_console { reattach_parent_console(); }
                 return false;
             }
@@ -3044,7 +3096,7 @@ pub mod mouse_inject {
                             // ignore-handler yet, so there is nothing to restore.)
                             log(&format!("raw-mode non-shell foreground pid={}: deliver raw 0x03, skip CTRL_C_EVENT", child_pid));
                             CloseHandle(handle);
-                            FreeConsole();
+                            detach_console();
                             if had_console { reattach_parent_console(); }
                             return false;
                         }
@@ -3096,7 +3148,7 @@ pub mod mouse_inject {
             // If we restore the default handler while still attached, the async
             // handler thread might terminate psmux.  Detaching first ensures the
             // event only targets processes that remain on the console.
-            FreeConsole();
+            detach_console();
 
             // Restore default Ctrl+C handling now that we're detached
             SetConsoleCtrlHandler(None, 0);
@@ -3155,8 +3207,7 @@ pub mod mouse_inject {
         // TRUE for CTRL_BREAK_EVENT is what keeps the server — and therefore every
         // other session — alive through our own broadcast.  Registered AFTER
         // AttachConsole and torn down immediately after, exactly like a terminal
-        // emulator's Ctrl+Break sender.  (The startup handler alone did not
-        // protect the server here; a freshly-registered handler does.)
+        // emulator's Ctrl+Break sender.
         unsafe extern "system" fn survive_break(ctrl_type: u32) -> i32 {
             match ctrl_type {
                 0 | 1 => 1, // CTRL_C_EVENT | CTRL_BREAK_EVENT -> handled, survive
@@ -3190,8 +3241,9 @@ pub mod mouse_inject {
 
             // Detach from the child's console first, then remove our temporary
             // handler so a late async break can only target processes that remain
-            // on the console.  The server's permanent startup handler remains.
-            FreeConsole();
+            // on the console.  `detach_console` leaves the server its survival
+            // handler.
+            detach_console();
             SetConsoleCtrlHandler(Some(survive_break), 0);
 
             if had_console {
@@ -3271,7 +3323,7 @@ pub mod mouse_inject {
 
             if handle == INVALID_HANDLE || handle == 0 {
                 debug_log(&format!("send_modified_key_event: CreateFileW(CONIN$) FAILED"));
-                FreeConsole();
+                detach_console();
                 if had_console { reattach_parent_console(); }
                 return false;
             }
@@ -3355,7 +3407,7 @@ pub mod mouse_inject {
                 child_pid, ch, ctrl, alt, shift, vk, scan, u_char_value, flags, result != 0, written));
 
             CloseHandle(handle);
-            FreeConsole();
+            detach_console();
             if had_console {
                 reattach_parent_console();
             }
@@ -3400,7 +3452,7 @@ pub mod mouse_inject {
 
             if handle == INVALID_HANDLE || handle == 0 {
                 debug_log(&format!("send_modified_enter_event: CreateFileW(CONIN$) FAILED"));
-                FreeConsole();
+                detach_console();
                 if had_console { reattach_parent_console(); }
                 return false;
             }
@@ -3489,7 +3541,7 @@ pub mod mouse_inject {
                 child_pid, ctrl, alt, shift, scan, u_char, flags, result != 0, written));
 
             CloseHandle(handle);
-            FreeConsole();
+            detach_console();
             if had_console {
                 reattach_parent_console();
             }
@@ -4975,6 +5027,63 @@ pub mod process_info {
             const { std::cell::Cell::new(0) };
     }
 
+    thread_local! {
+        /// A fresh table pinned for the duration of ONE Ctrl+C routing
+        /// decision (`pin_fresh`). While set, every `Duration::ZERO` caller on
+        /// this thread is served it instead of walking again.
+        static PINNED_TABLE: std::cell::RefCell<Option<ProcTable>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Restores the previous pin (normally none) when dropped.
+    pub struct PinnedTable {
+        prev: Option<ProcTable>,
+    }
+
+    impl Drop for PinnedTable {
+        fn drop(&mut self) {
+            let prev = self.prev.take();
+            PINNED_TABLE.with(|p| *p.borrow_mut() = prev);
+        }
+    }
+
+    /// Take ONE fresh walk and answer every live-tree question on this thread
+    /// from it until the guard drops.
+    ///
+    /// The Ctrl+C router asks about a dozen questions of the process tree
+    /// (foreground leaf, its pid, bridge leaf, bridge descendant, childless
+    /// fallback, recent bridge, then one per console member and the bridge
+    /// and native-app checks over the membership). Each used to be its own
+    /// `Duration::ZERO` walk at 9-11ms, so one Ctrl+C took 9 walks, 94-103ms,
+    /// measured with `PSMUX_PTY_TRACE` `W` lines, all on the server thread that
+    /// writes keystrokes into ConPTY: the 0x03 and every key typed behind it
+    /// waited that long. Answering them from one table is also what the router
+    /// already wants: a verdict and the identity it was based on should describe
+    /// the same moment.
+    pub fn pin_fresh() -> PinnedTable {
+        let fresh = walk_process_table();
+        let prev = PINNED_TABLE.with(|p| std::mem::replace(&mut *p.borrow_mut(), fresh));
+        PinnedTable { prev }
+    }
+
+    /// Re-walk the pinned table when it does not know one of `pids`.
+    ///
+    /// The console membership is enumerated after attaching, i.e. after the
+    /// pin was taken, so a process that joined the console in between (a
+    /// bridge launched that instant) would be invisible to the bridge checks.
+    /// Only then is a second walk paid. No-op without a pin.
+    pub fn repin_unless_known(pids: &[u32]) {
+        let missing = PINNED_TABLE.with(|p| {
+            p.borrow().as_ref().is_some_and(|t| {
+                pids.iter().any(|pid| !t.iter().any(|(p2, _, _)| p2 == pid))
+            })
+        });
+        if missing {
+            let fresh = walk_process_table();
+            PINNED_TABLE.with(|p| *p.borrow_mut() = fresh);
+        }
+    }
+
     /// Enumerate every process on the machine, with an optional freshness bound.
     ///
     /// `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)` walks the whole system —
@@ -5000,6 +5109,13 @@ pub mod process_info {
     /// Returns `None` only when the snapshot itself fails. Failures are never
     /// cached.
     fn process_table(max_age: std::time::Duration) -> Option<ProcTable> {
+        if max_age.is_zero() {
+            // Inside one Ctrl+C routing decision every live-tree question is
+            // answered from the table that decision pinned; see `pin_fresh`.
+            if let Some(table) = PINNED_TABLE.with(|p| p.borrow().clone()) {
+                return Some(table);
+            }
+        }
         if !max_age.is_zero() {
             // Recover a poisoned lock rather than skipping the cache. The inner
             // value is only ever a fully-published entry or None (the critical

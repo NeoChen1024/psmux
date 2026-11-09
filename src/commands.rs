@@ -2793,57 +2793,138 @@ pub(crate) const KILL_PANE_F_WITHOUT_A: &str = "-f only valid with -a";
 /// answers to it (tmux reads a bare window or pane target here first,
 /// cmd-find.c:1093-1110). Ids (`$`, `@`, `%`) and `window.pane` forms stay
 /// with the arms below. Returns true when the line was handled here.
-fn forward_to_other_session(app: &mut AppState, parts: &[&str], cmd: &str) -> bool {
+pub(crate) fn forward_to_other_session(app: &mut AppState, parts: &[&str], cmd: &str) -> bool {
+    match route_to_other_session(app, parts, cmd) {
+        OtherSessionRoute::Local => false,
+        OtherSessionRoute::Forwarded => true,
+        OtherSessionRoute::Refused(msg) => {
+            app.status_message = Some((msg, Instant::now(), None));
+            true
+        }
+    }
+}
+
+/// What [`route_to_other_session`] did with a line.
+#[derive(Debug, PartialEq)]
+pub(crate) enum OtherSessionRoute {
+    /// The target is this session's (or there is none): run it here.
+    Local,
+    /// Sent to the session it names.
+    Forwarded,
+    /// tmux's error for the target; nothing runs.
+    Refused(String),
+}
+
+/// tmux's error for a bare `-t` word that names no session, for the commands
+/// that read such a word as a session (cmd-find.c CMD_FIND_SESSION, and the
+/// option and environment commands, which report "no such session"). None
+/// for every other command: there a bare word may be a window or pane name,
+/// which the arms below resolve or refuse themselves.
+fn missing_bare_session_error(app: &AppState, command: &str, name: &str) -> Option<String> {
+    let wording = match command {
+        "list-windows" | "lsw" | "has-session" | "has" | "lock-session" | "locks" => "can't find session",
+        "set-environment" | "setenv" | "show-environment" | "showenv" => "no such session",
+        // A pane target: a bare word is a window of this session first.
+        "set-option" | "set" | "show-options" | "show" => {
+            if app.resolve_window_target(name).is_ok() {
+                return None;
+            }
+            "no such session"
+        }
+        _ => return None,
+    };
+    Some(format!("{}: {}", wording, name))
+}
+
+pub(crate) fn route_to_other_session(app: &mut AppState, parts: &[&str], cmd: &str) -> OtherSessionRoute {
+    let (name, port, key, line) = match decide_other_session(app, parts, cmd) {
+        OtherSessionDecision::Local => return OtherSessionRoute::Local,
+        OtherSessionDecision::Refused(msg) => return OtherSessionRoute::Refused(msg),
+        OtherSessionDecision::Other { name, port, key, line } => (name, port, key, line),
+    };
+    const FORWARD_CONNECT_LIMIT: std::time::Duration = std::time::Duration::from_millis(200);
+    let address = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&address, FORWARD_CONNECT_LIMIT)
+    else {
+        return OtherSessionRoute::Refused(format!("can't connect to session: {}", name));
+    };
+    let _ = stream.set_nodelay(true);
+    let _ = writeln!(stream, "AUTH {}", key);
+    let _ = stream.write_all(format!("{}\n", line).as_bytes());
+    let _ = stream.flush();
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(50)));
+    let _ = std::io::Read::read(&mut stream, &mut [0u8; 64]);
+    OtherSessionRoute::Forwarded
+}
+
+/// Where a line's `-t` sends it, decided without sending anything: the
+/// shared decision of [`route_to_other_session`], also asked by the TCP route
+/// for the commands whose reply it must relay (CtrlReq::DecideOtherSession).
+#[derive(Debug, PartialEq)]
+pub(crate) enum OtherSessionDecision {
+    Local,
+    Refused(String),
+    /// Another live session of this namespace: its port and key, and the
+    /// line with the target spelled out for that server.
+    Other { name: String, port: u16, key: String, line: String },
+}
+
+pub(crate) fn decide_other_session(app: &AppState, parts: &[&str], cmd: &str) -> OtherSessionDecision {
+    use OtherSessionDecision::{Local, Refused};
     let command = parts[0];
     if keeps_other_session_target_local(command) {
-        return false;
+        return Local;
     }
     let Some(target) = own_target_flag(command, &parts[1..]) else {
-        return false;
+        return Local;
     };
     let coerced = crate::cli::coerce_bare_window_target(command, target);
     if coerced != target {
-        return false;
+        return Local;
     }
     let plain = crate::cli::strip_exact_match_prefix(target);
     if plain.is_empty() || plain.starts_with(['@', '%']) {
-        return false;
+        return Local;
     }
     // `kill-session -a -t B` keeps B and ends the others: it is not B's to run.
     if matches!(command, "kill-session" | "kill-ses") && own_flag_set(command, &parts[1..], 'a') {
-        return false;
+        return Local;
     }
     // The session part and what follows it (`:1.0`, or nothing). A bare name
     // or `$id` is all session part; `w.p` without a colon is a window here.
     let bare = crate::cli::bare_target_token(target) || (plain.starts_with('$') && !plain.contains(':'));
     let (spec, rest) = match target.find(':') {
         Some(colon) if !crate::cli::strip_exact_match_prefix(&target[..colon]).is_empty() => target.split_at(colon),
-        Some(_) => return false,
+        Some(_) => return Local,
         None if bare => (target, ""),
-        None => return false,
+        None => return Local,
     };
     let name = match resolve_named_session(app, spec) {
-        NamedSession::Own => return false,
+        NamedSession::Own => return Local,
         NamedSession::Other(name) => name,
-        // A bare word that is no session is a window or pane name of this
-        // session, or tmux's own error, which the arms below give.
-        NamedSession::Missing if bare && !plain.starts_with('$') => return false,
+        // A bare word that is no session: tmux's error for a command that
+        // reads it as a session, else a window or pane name of this session
+        // (or tmux's own error), which the arms below give.
+        NamedSession::Missing if bare && !plain.starts_with('$') => {
+            return match missing_bare_session_error(app, command, plain) {
+                Some(msg) => Refused(msg),
+                None => Local,
+            };
+        }
         NamedSession::Missing => {
             let shown = crate::cli::strip_exact_match_prefix(spec);
-            app.status_message = Some((format!("can't find session: {}", shown), Instant::now(), None));
-            return true;
+            return Refused(format!("can't find session: {}", shown));
         }
     };
     if bare && !plain.starts_with('$') && app.resolve_window_target(plain).is_ok() {
-        return false;
+        return Local;
     }
     let base = crate::session::session_name_base(app.socket_name.as_deref(), &name);
     let Some(port) = std::fs::read_to_string(crate::paths::port_file(&base))
         .ok()
         .and_then(|text| text.trim().parse::<u16>().ok())
     else {
-        app.status_message = Some((format!("can't find session: {}", name), Instant::now(), None));
-        return true;
+        return Refused(format!("can't find session: {}", name));
     };
     // The receiving server reads the target again, by exact name: a prefix,
     // pattern or `$id` resolved here is spelled out. A session command takes
@@ -2859,14 +2940,12 @@ fn forward_to_other_session(app: &mut AppState, parts: &[&str], cmd: &str) -> bo
         Some((i, at)) if parts[1 + i][at..] != resolved => {
             let mut rebuilt: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
             rebuilt[1 + i] = format!("{}{}", &parts[1 + i][..at], resolved);
-            let refs: Vec<&str> = rebuilt.iter().map(String::as_str).collect();
-            requote(&refs)
+            rebuilt.iter().map(|word| crate::util::quote_arg_for_handler(word)).collect::<Vec<_>>().join(" ")
         }
         _ => cmd.to_string(),
     };
     let key = crate::session::read_session_key(&base).unwrap_or_default();
-    let _ = send_control_to_port(port, &format!("{}\n", line), &key);
-    true
+    OtherSessionDecision::Other { name, port, key, line }
 }
 
 /// Kill every window but the one at `keep`, as tmux's `kill-window -a`
@@ -3020,6 +3099,15 @@ fn execute_unaliased_command(app: &mut AppState, cmd: &str) -> io::Result<()> {
     // named the window `'TEST'`, quotes included, and `'a b'` became `'a`
     // (#789 follow up). Arms that hand `cmd` on whole are unaffected.
     let mut tokens = parse_command_line(cmd);
+    // An attached target is the target: tmux's getopt reads `-t:0` as
+    // `-t :0`, and the CLI splits it before it forwards (main.rs). The arms
+    // below and the forward to another session match the `-t` token alone, so
+    // a hook's `rename-window -t:0 X` renamed the ACTIVE window and a
+    // prompt's `kill-session -tK2` killed the current session (#1005).
+    let split = crate::cli::normalize_command_words(tokens.clone(), false);
+    if split != tokens {
+        return execute_unaliased_command(app, &crate::command_alias::command_line(&split));
+    }
     // `-t s:1.` is `-t s:1` (tmux reads an empty pane part as none). The line
     // is rebuilt, so the arms that hand `cmd` on whole carry it too.
     if crate::cli::canonicalize_target_values(&mut tokens) {
@@ -3802,7 +3890,19 @@ fn execute_unaliased_command(app: &mut AppState, cmd: &str) -> io::Result<()> {
         "detach-client" | "detach" => {
             // handled by caller to set quit flag
         }
-        "rename-session" => {
+        "rename-session" | "rename" => {
+            // tmux reads -t as a session (cmd-rename-session.c, CMD_FIND_SESSION).
+            // Another session that exists was forwarded to its own server
+            // above; one that does not is "can't find session", and this
+            // session keeps its name.
+            if let Some(target) = own_target_flag(parts[0], &parts[1..]) {
+                let spec = target.split(':').next().unwrap_or(target);
+                if resolve_named_session(app, spec) != NamedSession::Own {
+                    let shown = crate::cli::strip_exact_match_prefix(spec);
+                    app.status_message = Some((format!("can't find session: {}", shown), Instant::now(), None));
+                    return Ok(());
+                }
+            }
             if let Some(name) = crate::cli::first_operand("rename-session", &parts[1..]) {
                 // A name the server refuses must not become this client's
                 // name either.
@@ -3810,10 +3910,24 @@ fn execute_unaliased_command(app: &mut AppState, cmd: &str) -> io::Result<()> {
                     app.status_message = Some((msg, Instant::now(), None));
                     return Ok(());
                 }
-                app.session_name = name.to_string();
-                // Forward to server so external queries see the new session name
-                if let Some(port) = app.control_port {
-                    let _ = send_control_to_port(port, &format!("rename-session {}\n", crate::util::quote_arg(name)), &app.session_key);
+                if crate::server::shared::in_shared_server_process() {
+                    // The shared server (#798, PSMUX_SERVER_MODE=shared only)
+                    // refuses CtrlReq::RenameSession on its listener, so its
+                    // sessions are renamed here, in memory, exactly as before
+                    // the default mode's fix below.
+                    app.session_name = name.to_string();
+                    if let Some(port) = app.control_port {
+                        let _ = send_control_to_port(port, &format!("rename-session {}\n", crate::util::quote_arg(name)), &app.session_key);
+                    }
+                } else if let Some(port) = app.control_port {
+                    // The server's rename moves the registry files from the
+                    // CURRENT name and refuses a duplicate, so the name must
+                    // still be the old one when it runs. Setting it here first
+                    // left the old .port behind (ls listed the session twice)
+                    // and let a rename onto a live session overwrite its files.
+                    let _ = send_control_to_port(port, &format!("rename-session -- {}\n", crate::util::quote_arg(name)), &app.session_key);
+                } else {
+                    app.session_name = name.to_string();
                 }
             }
         }
@@ -4602,6 +4716,17 @@ fn execute_unaliased_command(app: &mut AppState, cmd: &str) -> io::Result<()> {
                     i += 1;
                 }
             }
+            if crate::server::shared::queue_loop_start(
+                session_name.as_deref(),
+                window_name.as_deref(),
+                start_dir.as_deref(),
+                initial_command.as_deref(),
+                &env_vars,
+                (app.client_area.width, app.client_area.height),
+                app.session_id,
+            ) {
+                return Ok(());
+            }
 
             // Generate session name if not provided
             let ns_prefix = app.socket_name.as_deref();
@@ -5159,8 +5284,24 @@ mod tests_refresh_client_l_server_route;
 mod tests_hook_kill_session_target;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_hook_rename_session_target.rs"]
+mod tests_hook_rename_session_target;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_missing_session_targets.rs"]
+mod tests_missing_session_targets;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_missing_session_targets_relay.rs"]
+mod tests_missing_session_targets_relay;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_issue938_arg_parsing.rs"]
 mod tests_issue938_arg_parsing;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue1005_attached_target.rs"]
+mod tests_issue1005_attached_target;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue964_kill_pane_all.rs"]

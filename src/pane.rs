@@ -1952,7 +1952,7 @@ pub fn spawn_warm_pane_from(pty_system: &dyn portable_pty::PtySystem, p: &WarmSp
         console_wait as f64 / 1000.0,
         os_create as f64 / 1000.0
     );
-    Ok(crate::types::WarmPane { master: pair.master, writer: pty_writer, child, term, data_version, cursor_shape, bell_pending, cpr_pending, color_query_pending, child_pid, pane_id, rows, cols, output_ring, spawned_at: now, ready: false, last_dv: 0, last_change: now, trace_settled: false, ready_via_backstop: false, spawn_cwd, host_colors: p.host_colors.clone() })
+    Ok(crate::types::WarmPane { master: pair.master, writer: pty_writer, child, term, data_version, cursor_shape, bell_pending, cpr_pending, color_query_pending, child_pid, pane_id, rows, cols, output_ring, spawned_at: now, ready: false, last_dv: 0, last_change: now, trace_settled: false, ready_via_backstop: false, shows_text: false, spawn_cwd, host_colors: p.host_colors.clone() })
 }
 
 pub fn split_active(app: &mut AppState, kind: LayoutKind) -> io::Result<()> {
@@ -2445,15 +2445,17 @@ fn kill_pane_at_path(win: &mut Window, path: &Vec<usize>) {
     // that is already dead back to the reaper. Under `on` the window used to
     // stay with a dead pane in it.
     let last_pane = matches!(win.root, Node::Leaf(_));
-    // Explicitly kill the target pane's process tree FIRST.
     // remove_node() doesn't call kill_node() when the root is a single Leaf,
-    // so we must do it here to ensure no orphaned processes.
-    if let Some(p) = active_pane_mut(&mut win.root, path) {
-        if last_pane {
+    // so the last pane's tree is killed here, and its node stays for the
+    // reaper. Any other pane is cut out below and kill_node() kills its tree
+    // on the pane kill worker. Killing it here as well cost the server loop a
+    // second tree kill: three process snapshot walks per kill-pane.
+    if last_pane {
+        if let Some(p) = active_pane_mut(&mut win.root, path) {
             p.pane_options.insert("remain-on-exit".to_string(), "off".to_string());
             p.dead = false;
+            crate::platform::process_kill::kill_process_tree(&mut p.child);
         }
-        crate::platform::process_kill::kill_process_tree(&mut p.child);
     }
     // In cells, so the neighbour gets exactly the dead pane's cells.
     crate::tree::normalize_window_sizes(win);
@@ -4271,6 +4273,11 @@ pub(crate) struct DecrqmState {
     pub mouse_all: bool,
     pub mouse_utf8: bool,
     pub mouse_sgr: bool,
+    /// Autowrap is off (DECAWM reset). The default, false, is a new screen,
+    /// which wraps.
+    pub autowrap_off: bool,
+    /// Insert mode (IRM) is on.
+    pub insert_mode: bool,
     /// A synchronized update (DECSET 2026) is open in the pane's `SyncGate`.
     pub synchronized_output: bool,
     /// The pane's size in cells, for the XTWINOPS size reports (issue #841).
@@ -4290,6 +4297,8 @@ impl DecrqmState {
             mouse_all: s.mouse_all_flag(),
             mouse_utf8: s.mouse_utf8_flag(),
             mouse_sgr: s.mouse_sgr_flag(),
+            autowrap_off: !s.autowrap(),
+            insert_mode: s.insert_mode(),
             synchronized_output: false,
             rows: s.size().0,
             cols: s.size().1,
@@ -4304,6 +4313,7 @@ fn decrqm_private_value(mode: u16, st: &DecrqmState) -> u8 {
     match mode {
         1 => onoff(st.application_cursor),          // DECCKM
         3 => 4,                                     // DECCOLM, permanently reset
+        7 => onoff(!st.autowrap_off),               // DECAWM
         25 => onoff(st.cursor_visible),             // DECTCEM
         47 | 1047 | 1049 => onoff(st.alternate_screen),
         1000 => onoff(st.mouse_standard),
@@ -4324,9 +4334,14 @@ fn decrqm_private_value(mode: u16, st: &DecrqmState) -> u8 {
     }
 }
 
-/// DECRQM for an ANSI mode.  psmux tracks none of them (tmux answers only IRM,
-/// input.c:1637-1649), so every mode reports 0, "not recognised".
-fn decrqm_ansi_value(_mode: u16) -> u8 { 0 }
+/// DECRQM for an ANSI mode.  Like tmux, only IRM is known (input.c:1638-1649
+/// at tag 3.8); every other mode reports 0, "not recognised".
+fn decrqm_ansi_value(mode: u16, st: &DecrqmState) -> u8 {
+    match mode {
+        4 => if st.insert_mode { 1 } else { 2 },
+        _ => 0,
+    }
+}
 
 /// Fixed OSC 7501 capability reply or tmux-compatible device reply.
 /// Empty for a zero-mode DECRQM, matching tmux's `if (m > 0)` guard.
@@ -4344,7 +4359,7 @@ pub(crate) fn device_reply(q: DeviceQuery, st: &DecrqmState) -> String {
             format!("\x1b[?{};{}$y", m, decrqm_private_value(m, st))
         }
         DeviceQuery::DecrqmAnsi(m) if m > 0 => {
-            format!("\x1b[{};{}$y", m, decrqm_ansi_value(m))
+            format!("\x1b[{};{}$y", m, decrqm_ansi_value(m, st))
         }
         DeviceQuery::WindowReport(op) => window_report(op, st.rows, st.cols),
         _ => String::new(),
@@ -4461,10 +4476,11 @@ pub(crate) fn pane_replies(
     let colour = |text: Option<String>, bit: u32| {
         text.map(|text| PaneReply { text, fallback: ReplyFallback::Colour(bit), console_host: false })
     };
-    let fg = || colour(foreground_reply(colours), COLOR_QUERY_FG);
-    let bg = || colour(background_reply(colours), COLOR_QUERY_BG);
-    let mut burst = !queries.contains(&DeviceQuery::ForegroundColour)
-        || !queries.contains(&DeviceQuery::BackgroundColour);
+    let fg = |bel| colour(foreground_reply(colours, bel), COLOR_QUERY_FG);
+    let bg = |bel| colour(background_reply(colours, bel), COLOR_QUERY_BG);
+    let asked_fg = queries.iter().any(|q| matches!(q, DeviceQuery::ForegroundColour { .. }));
+    let asked_bg = queries.iter().any(|q| matches!(q, DeviceQuery::BackgroundColour { .. }));
+    let mut burst = !asked_fg || !asked_bg;
     let mut out = Vec::with_capacity(queries.len());
     for &q in queries {
         let reply = match q {
@@ -4474,16 +4490,26 @@ pub(crate) fn pane_replies(
                 console_host: false,
             }),
             DeviceQuery::ColourScheme => colour(Some(scheme_reply(colours)), COLOR_QUERY_SCHEME),
-            DeviceQuery::ForegroundColour => fg(),
-            DeviceQuery::BackgroundColour => bg(),
-            DeviceQuery::PaletteColour { index, own } => {
+            DeviceQuery::ForegroundColour { bel } => fg(bel),
+            DeviceQuery::BackgroundColour { bel } => bg(bel),
+            DeviceQuery::PaletteColour { index, own, bel } => {
                 let i = usize::from(index);
                 if i == 0 && burst {
+                    // The burst's own OSC 10 and 11 never arrived, so they
+                    // end the way its palette query did.
                     burst = false;
-                    if !queries.contains(&DeviceQuery::ForegroundColour) { out.extend(fg()); }
-                    if !queries.contains(&DeviceQuery::BackgroundColour) { out.extend(bg()); }
+                    if !asked_fg { out.extend(fg(bel)); }
+                    if !asked_bg { out.extend(bg(bel)); }
                 }
-                colour(palette_reply(i, colours, own), 1 << i)
+                let text = palette_reply(i, colours, own, bel);
+                if i < 16 {
+                    colour(text, 1 << i)
+                } else {
+                    // The colour path's bits hold only the sixteen ANSI
+                    // colours, and it would ask the outer terminal's value,
+                    // which psmux does not have for this index.
+                    text.map(|text| PaneReply { text, fallback: ReplyFallback::Lost("OSC 4"), console_host: false })
+                }
             }
             _ => {
                 let console_host = q == DeviceQuery::Da1 && std::mem::take(console_host_da1_open);

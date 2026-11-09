@@ -119,7 +119,7 @@ pub(crate) fn sync_held_marker(app: &AppState) {
 /// One body for both kill-server routes — the one-shot CLI request and an
 /// attached client's namespace-wide kill (which fans out to its peers first,
 /// then lands here) — so the shutdown sequence cannot drift between them.
-fn shutdown_this_server(app: &mut AppState) -> ! {
+fn shutdown_this_server(app: &mut AppState, session_guard: &mut Option<crate::platform::SessionMutex>) -> ! {
     crate::warm_trace!(
         "shutdown: pooled spares={} inflight={} pending={:?}",
         app.warm_pane.len(),
@@ -154,6 +154,7 @@ fn shutdown_this_server(app: &mut AppState) -> ! {
     let _ = std::fs::remove_file(&regpath);
     let _ = std::fs::remove_file(&keypath);
     let _ = std::fs::remove_file(crate::paths::held_file(app.port_file_base()));
+    release_session_name(session_guard);
     // Kill all child processes using a single process snapshot
     tree::kill_all_children_batch(&mut app.windows);
     // ...and the panes this server hosts for other sessions (join-pane).
@@ -1982,6 +1983,19 @@ fn move_window_request(
     app.move_window(src, dst, detach, renumber, after, before)
 }
 
+/// Give up this server's claim on its session name the moment it stops
+/// advertising it. Every teardown deletes the `.port` first, so `has-session`
+/// already says the session is gone, but the process then spends up to seconds
+/// killing pane shells and spares before it exits, and the named mutex used to
+/// be held for all of that. A `new-session` of the same name in that window
+/// (a hook running `kill-session -t D` and the next command making D again)
+/// started a server that found the mutex owned, took itself for a duplicate and
+/// exited, so the client said "failed to create session". tmux frees the name
+/// as soon as the session is destroyed; so does this.
+fn release_session_name(guard: &mut Option<crate::platform::SessionMutex>) {
+    *guard = None; // drop releases and closes the mutex
+}
+
 fn rekey_session_guard(guard: &mut Option<crate::platform::SessionMutex>, new_base: &str) {
     *guard = None; // drop releases + closes the old name's mutex
     *guard = crate::platform::acquire_session_mutex(new_base);
@@ -3199,7 +3213,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 crate::session::remove_session_registry_files(std::path::Path::new(
                     &crate::paths::port_file(&app.port_file_base()),
                 ));
-                shutdown_this_server(&mut app);
+                shutdown_this_server(&mut app, &mut session_guard);
             }
         }
 
@@ -3698,7 +3712,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     // -T: the just-created pane is currently active in this
                     // window, so set its title before any detached revert.
-                    if let Some(t) = title {
+                    // A refused split made no pane, so the title stays off the
+                    // pane that was active (#1000).
+                    if let Some(t) = title.filter(|_| split_succeeded) {
                         let win = &mut app.windows[app.active_idx];
                         if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
                             p.title_locked = !t.is_empty();
@@ -3744,7 +3760,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // runs at the loop top during an idle gap (Tier 3), so a burst
                     // of window-creates never chains blocking spawns that stall
                     // other clients' commands.
-                    resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-split-window");
+                    resize_all_panes(&mut app); meta_dirty = true;
+                    // tmux runs a command's after- hook only when it succeeded.
+                    if split_succeeded { hook_event = Some("after-split-window"); }
                     }
                 }
                 CtrlReq::SplitWindowPrint(k, cmd, detached, start_dir, split_size, format_str, resp, title, env_sets, zoom_after_split) => {
@@ -3756,10 +3774,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // CtrlReq::NewWindow above.
                     let prev_pane_id = crate::tree::get_active_pane_id(&app.windows[app.active_idx].root, &app.windows[app.active_idx].active_path);
                     let keep = split_size.keep.clone();
+                    // A refused split answers with its error, as without -P
+                    // (#1000): it used to print the format for the pane that
+                    // was active, an existing one, and exit 0, so a caller
+                    // sent its keys into another program's pane.
+                    let mut refused: Option<String> = None;
                     let split_succeeded = match crate::pane::split_active_placed(&mut app, k, cmd.as_deref(), Some(&*pty_system), start_dir.as_deref(), &env_sets, split_size) {
                         Err(e) => {
-                            app.status_message = Some((format!("split-window: {e}"), std::time::Instant::now(), None));
-                            eprintln!("psmux: split-window error: {e}");
+                            let msg = format!("split-window: {e}");
+                            app.status_message = Some((msg.clone(), std::time::Instant::now(), None));
+                            refused = Some(format!("psmux: {msg}"));
                             false
                         }
                         Ok(()) => true,
@@ -3769,7 +3793,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         crate::pane::apply_split_keep(&mut app, &keep);
                     }
                     // -T: set the new (currently active) pane's title.
-                    if let Some(t) = title {
+                    if let Some(t) = title.filter(|_| split_succeeded) {
                         let win = &mut app.windows[app.active_idx];
                         if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
                             p.title_locked = !t.is_empty();
@@ -3805,13 +3829,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         resize_all_panes(&mut app);
                         toggle_zoom(&mut app);
                     }
-                    let _ = resp.send(pane_info);
+                    let _ = resp.send(refused.unwrap_or(pane_info));
                     // Replenish warm pane
                     // Warm-pane replenish is deferred OFF the command path — it
                     // runs at the loop top during an idle gap (Tier 3), so a burst
                     // of window-creates never chains blocking spawns that stall
                     // other clients' commands.
-                    resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-split-window");
+                    resize_all_panes(&mut app); meta_dirty = true;
+                    // tmux runs a command's after- hook only when it succeeded.
+                    if split_succeeded { hook_event = Some("after-split-window"); }
                 }
                 CtrlReq::KillPane => {
                     if let Some(cmds) = app.hooks.get("before-kill-pane") { let cmds = cmds.clone(); crate::commands::run_hook_commands(&mut app, &cmds); }
@@ -4180,6 +4206,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             let _ = std::fs::remove_file(&regpath);
                             let _ = std::fs::remove_file(&keypath);
                             crate::session::remove_session_id_file(&app.port_file_base());
+                            release_session_name(&mut session_guard);
                             crate::types::shutdown_persistent_streams();
                             tree::kill_all_children_batch(&mut app.windows);
                             app.warm_pane.kill_all();
@@ -5557,6 +5584,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let _ = std::fs::remove_file(&regpath);
                     let _ = std::fs::remove_file(&keypath);
                     crate::session::remove_session_id_file(&app.port_file_base());
+                    release_session_name(&mut session_guard);
                     // A control client of a destroyed session gets a bare
                     // `%exit` (tmux server_destroy_session sets CLIENT_EXIT,
                     // MSG_EXIT carries no message: client.c:416-421), not a
@@ -5700,7 +5728,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             have, want
                         ));
                         let _ = resp.send("ERR: warm server uses another console host (PSMUX_CONPTY_DIR)\n".to_string());
-                        shutdown_this_server(&mut app);
+                        shutdown_this_server(&mut app, &mut session_guard);
                     } else {
                     warm_debug(&format!("CLAIM ACCEPT: __warm__ (port={:?}) -> '{}'", app.control_port, name));
                     // The `new-session -n NAME` window name is applied FIRST,
@@ -7523,6 +7551,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let _ = std::fs::remove_file(&regpath);
                         let _ = std::fs::remove_file(&keypath);
                         crate::session::remove_session_id_file(&app.port_file_base());
+                        release_session_name(&mut session_guard);
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         app.warm_pane.kill_all();
@@ -7622,6 +7651,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let _ = std::fs::remove_file(&regpath);
                         let _ = std::fs::remove_file(&keypath);
                         crate::session::remove_session_id_file(&app.port_file_base());
+                        release_session_name(&mut session_guard);
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         app.warm_pane.kill_all();
@@ -7677,6 +7707,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let _ = std::fs::remove_file(&regpath);
                         let _ = std::fs::remove_file(&keypath);
                         crate::session::remove_session_id_file(&app.port_file_base());
+                        release_session_name(&mut session_guard);
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         app.warm_pane.kill_all();
@@ -8003,6 +8034,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     enter_copy_mode(&mut app);
                     crate::copy_mode::page_scroll(&mut app, true, false);
                 }
+                CtrlReq::ResetPaneTerminal => {
+                    crate::window_ops::reset_active_pane_terminal(&mut app);
+                }
                 CtrlReq::ClearHistory => {
                     // Leaves copy mode first and clears the LIVE grid, the way
                     // tmux does; see clear_active_pane_history.
@@ -8101,10 +8135,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         scope,
                         Some(&own_base),
                     );
-                    shutdown_this_server(&mut app);
+                    shutdown_this_server(&mut app, &mut session_guard);
                 }
                 CtrlReq::KillServer => {
-                    shutdown_this_server(&mut app);
+                    shutdown_this_server(&mut app, &mut session_guard);
                 }
                 CtrlReq::WaitFor(channel, op) => {
                     match op {
@@ -8886,6 +8920,48 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         Err(e) => { let _ = resp.send(format!("error: {}", e)); }
                     }
                 }
+                CtrlReq::DecideOtherSession(line, resp) => {
+                    let words = crate::commands::parse_command_line(&line);
+                    let parts: Vec<&str> = words.iter().map(String::as_str).collect();
+                    let decision = if parts.is_empty() {
+                        crate::commands::OtherSessionDecision::Local
+                    } else {
+                        crate::commands::decide_other_session(&app, &parts, &line)
+                    };
+                    let reply = match decision {
+                        crate::commands::OtherSessionDecision::Local => Ok(None),
+                        crate::commands::OtherSessionDecision::Other { port, key, line, .. } => Ok(Some((port, key, line))),
+                        crate::commands::OtherSessionDecision::Refused(msg) => {
+                            app.status_message = Some((msg.clone(), std::time::Instant::now(), None));
+                            state_dirty = true;
+                            Err(msg)
+                        }
+                    };
+                    let _ = resp.send(reply);
+                }
+                CtrlReq::ForwardToOtherSession(line, resp) => {
+                    let words = crate::commands::parse_command_line(&line);
+                    let parts: Vec<&str> = words.iter().map(String::as_str).collect();
+                    let route = if parts.is_empty() {
+                        crate::commands::OtherSessionRoute::Local
+                    } else {
+                        crate::commands::route_to_other_session(&mut app, &parts, &line)
+                    };
+                    let reply = match route {
+                        crate::commands::OtherSessionRoute::Local => Ok(false),
+                        crate::commands::OtherSessionRoute::Forwarded => Ok(true),
+                        // The connection answers ERROR; the status line says
+                        // it too, as for any refused target.
+                        crate::commands::OtherSessionRoute::Refused(msg) => {
+                            app.status_message = Some((msg.clone(), std::time::Instant::now(), None));
+                            Err(msg)
+                        }
+                    };
+                    if reply != Ok(false) {
+                        state_dirty = true;
+                    }
+                    let _ = resp.send(reply);
+                }
             }
             // A claim just made the standby a session: its hooks see it.
             crate::format::set_sessionless(app.is_held_standby());
@@ -9511,6 +9587,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 crate::session::remove_session_registry_files(std::path::Path::new(
                     &crate::paths::port_file(&app.port_file_base()),
                 ));
+                release_session_name(&mut session_guard);
                 if crate::types::send_directive_to_all_clients("DETACH") > 0 {
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -9522,6 +9599,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 // a teardown during a surge left the shells born a few milliseconds
                 // later parented to a dead psmux, idle at a prompt forever (#686).
                 crate::warm_pane_sync::reap_inflight_spares();
+                // Panes removed just before the end whose kill is still queued.
+                tree::pane_kill::flush(Duration::from_secs(3));
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 app.pipe_panes.clear();
                 std::process::exit(0);

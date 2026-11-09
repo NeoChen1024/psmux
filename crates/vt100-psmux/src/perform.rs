@@ -40,6 +40,12 @@ pub struct WrappedScreen<CB: crate::callbacks::Callbacks = ()> {
     /// `ESC P` + params + intermediates + `q` (from `hook`), the payload (from
     /// `put`), and a trailing `ST` (appended in `unhook`).
     dcs_buf: Vec<u8>,
+    /// The character REP (`CSI Ps b`) repeats: the last one printed, until
+    /// a control character, an escape, a CSI, an OSC or a DCS ends it, as
+    /// tmux's `ictx->last` and `INPUT_LAST` (input.c:1230-1250, :2859-2893
+    /// and the dispatchers' ends, :1383, :1459, :1895, :2549, :2694 at tag
+    /// 3.8).
+    last_printed: Option<char>,
 }
 
 impl WrappedScreen<()> {
@@ -63,6 +69,7 @@ impl<CB: crate::callbacks::Callbacks> WrappedScreen<CB> {
             callbacks,
             dcs_active: false,
             dcs_buf: Vec::new(),
+            last_printed: None,
         }
     }
 
@@ -74,6 +81,7 @@ impl<CB: crate::callbacks::Callbacks> WrappedScreen<CB> {
             callbacks,
             dcs_active: false,
             dcs_buf: Vec::new(),
+            last_printed: None,
         }
     }
 }
@@ -94,11 +102,16 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
         if ('\u{80}'..'\u{a0}').contains(&c) {
             self.callbacks.unhandled_char(&mut self.screen, c);
         } else {
-            self.screen.text(c);
+            // The line drawing set turns `q` into `─` here; REP repeats the
+            // letter, so the set in use when it repeats applies, as in tmux
+            // (input.c:1811-1815 at tag 3.8) and the console hosts.
+            self.screen.text(self.screen.charset_map(c));
+            self.last_printed = Some(c);
         }
     }
 
     fn execute(&mut self, b: u8) {
+        self.last_printed = None;
         match b {
             7 => {
                 self.screen.audible_bell_count = self.screen.audible_bell_count.wrapping_add(1);
@@ -110,14 +123,23 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             11 => self.screen.vt(),
             12 => self.screen.ff(),
             13 => self.screen.cr(),
-            // we don't implement shift in/out alternate character sets, but
-            // it shouldn't count as an "error"
-            14 | 15 => {}
+            // SO chooses G1 and SI G0 (input.c:1372-1377 at tag 3.8).
+            14 => self.screen.shift_charset(true),
+            15 => self.screen.shift_charset(false),
             _ => self.callbacks.unhandled_control(&mut self.screen, b),
         }
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, b: u8) {
+        self.last_printed = None;
+        // `ESC ( 0` and `ESC ) 0` put the line drawing set into G0 or G1,
+        // `ESC ( B` and `ESC ) B` ASCII (input.c:241-249, :1442-1453 at tag
+        // 3.8). Any other set (`ESC ( A`, the UK one) stays unhandled, as in
+        // tmux.
+        if let ([g @ (b'(' | b')')], b'0' | b'B') = (intermediates, b) {
+            self.screen.designate_charset(*g == b')', b == b'0');
+            return;
+        }
         if let Some(i) = intermediates.first() {
             self.callbacks.unhandled_escape(
                 &mut self.screen,
@@ -155,6 +177,8 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
         _ignore: bool,
         c: char,
     ) {
+        // Only REP reads it, and every CSI, REP included, ends it.
+        let last_printed = self.last_printed.take();
         if let Some(query) = crate::queries::csi_query(params, intermediates, _ignore, c) {
             self.screen.query(query);
         }
@@ -190,6 +214,25 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 'S' => self.screen.su(canonicalize_params_1(params, 1)),
                 'T' => self.screen.sd(canonicalize_params_1(params, 1)),
                 'X' => self.screen.ech(canonicalize_params_1(params, 1)),
+                // REP: the last character printed, n more times
+                // (input.c:1799-1818 at tag 3.8). Each goes through `print`,
+                // as tmux adds each through screen_write_collect_add.
+                //
+                // tmux stops at the right margin; the console hosts, the
+                // inbox conhost and OpenConsole alike, wrap and go on, as
+                // xterm does. psmux follows the console host, so the pane's
+                // screen and cursor stay where the host has them on the
+                // OpenConsole route, and the same as the inbox route, where
+                // the host repeats before psmux reads the output (Discussion
+                // #937). The count is a parameter, at most 65535.
+                'b' => {
+                    if let Some(last) = last_printed {
+                        for _ in 0..canonicalize_params_1(params, 1) {
+                            vte::Perform::print(self, last);
+                        }
+                        self.last_printed = None;
+                    }
+                }
                 'd' => self.screen.vpa(canonicalize_params_1(params, 1)),
                 'h' => self.screen.sm(params, unhandled),
                 'l' => self.screen.rm(params, unhandled),
@@ -221,6 +264,19 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                                 *x.first().unwrap_or(&screen_cols)
                             });
                         self.callbacks.resize(&mut self.screen, (rows, cols));
+                    } else if op == Some(22) || op == Some(23) {
+                        // Save (22) or restore (23) the title, for both
+                        // titles (0) or the window title (2); the icon name
+                        // alone (1), or no second parameter, does nothing
+                        // (input.c:2187-2209 at tag 3.8).
+                        let which = params_iter.next().and_then(|x| x.first().copied());
+                        if matches!(which, Some(0 | 2)) {
+                            if op == Some(22) {
+                                self.screen.push_title();
+                            } else {
+                                self.screen.pop_title();
+                            }
+                        }
                     } else {
                         self.callbacks.unhandled_csi(
                             &mut self.screen,
@@ -294,40 +350,55 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bel_terminated: bool) {
-        if let Some(query) = crate::queries::osc_query(params, self.screen.program_status_enabled()) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bel_terminated: bool) {
+        self.last_printed = None;
+        if let Some(query) = crate::queries::osc_query(params, self.screen.program_status_enabled(), bel_terminated) {
             self.screen.query(query);
             return;
         }
         match params {
-            [b"0", s] => {
-                self.callbacks.set_window_icon_name(&mut self.screen, s);
-                self.callbacks.set_window_title(&mut self.screen, s);
-                self.screen.set_title(s);
+            // A title is everything after the first `;`, more `;` included
+            // (input_exit_osc, input.c:2714-2731 at tag 3.8): vte splits the
+            // string on every `;`, so the pieces are joined back. vte keeps
+            // sixteen pieces at most, so the end of a title holding more than
+            // fourteen `;` is lost.
+            [b"0", rest @ ..] if !rest.is_empty() => {
+                let s = osc_rest(rest);
+                self.callbacks.set_window_icon_name(&mut self.screen, &s);
+                self.callbacks.set_window_title(&mut self.screen, &s);
+                self.screen.set_title(&s);
             }
-            [b"1", s] => {
-                self.callbacks.set_window_icon_name(&mut self.screen, s);
+            [b"1", rest @ ..] if !rest.is_empty() => {
+                self.callbacks.set_window_icon_name(&mut self.screen, &osc_rest(rest));
             }
-            [b"2", s] => {
-                self.callbacks.set_window_title(&mut self.screen, s);
-                self.screen.set_title(s);
+            [b"2", rest @ ..] if !rest.is_empty() => {
+                let s = osc_rest(rest);
+                self.callbacks.set_window_title(&mut self.screen, &s);
+                self.screen.set_title(&s);
             }
             // ---- OSC 4 : set one or more palette entries (issue #685) ----
             // `\e]4;<i>;<colour>[;<i>;<colour>]*\e\\`.  vte splits on ';', so
             // the pairs arrive as flat params.  tmux parses exactly the same
             // shape in `input_osc_4` (input.c:2927), and so does
             // `palette_pairs`, which stops at a bad index (input.c:2941
-            // `bad = 1; break;`).  A `?` for one of the sixteen ANSI colours
-            // is a QUERY, taken in the order written with the pane's own entry
-            // as it stands at that pair, so a set before it in the same OSC
-            // is what it reports, as in tmux.  psmux answers it in stream
-            // order with the other queries (issue #473).
+            // `bad = 1; break;`).  A `?` is a QUERY, taken in the order
+            // written with the pane's own entry as it stands at that pair, so
+            // a set before it in the same OSC is what it reports, as in tmux.
+            // psmux answers one of the sixteen ANSI colours from the outer
+            // terminal when the pane has no entry, and any other index only
+            // from the pane's entry; tmux asks the outer terminal for those
+            // (input_add_request, input.c:2956), psmux does not yet.  The
+            // answers go in stream order with the other queries (#473).
             [b"4", rest @ ..] if !rest.is_empty() => {
                 for (idx, spec) in crate::queries::palette_pairs(rest) {
                     if spec == b"?" {
-                        if crate::queries::is_palette_query(idx, spec) {
-                            let own = self.screen.palette_entry(idx);
-                            self.screen.query(crate::TerminalQuery::PaletteColour { index: idx, own });
+                        let own = self.screen.palette_entry(idx);
+                        if crate::queries::is_palette_query(idx, spec, own) {
+                            self.screen.query(crate::TerminalQuery::PaletteColour {
+                                index: idx,
+                                own,
+                                bel: bel_terminated,
+                            });
                         }
                         continue;
                     }
@@ -391,7 +462,7 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             [b"7501", body @ ..] if self.screen.program_status_enabled() => {
                 // vte excludes OSC/ST and semicolon separators from params.
                 let sequence_len = 2 + params.iter().map(|p| p.len()).sum::<usize>()
-                    + params.len().saturating_sub(1) + if _bel_terminated { 1 } else { 2 };
+                    + params.len().saturating_sub(1) + if bel_terminated { 1 } else { 2 };
                 if sequence_len <= 4096 {
                     self.screen.program_status_mut().report(&body.join(&b';'));
                 }
@@ -583,6 +654,7 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
     }
 
     fn unhook(&mut self) {
+        self.last_printed = None;
         if !self.dcs_active {
             return;
         }
@@ -1096,6 +1168,11 @@ fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
         _ => {}
     }
     Some(out)
+}
+
+/// The OSC string after its number, with the `;` vte split it on put back.
+fn osc_rest(rest: &[&[u8]]) -> Vec<u8> {
+    rest.join(&b';')
 }
 
 fn canonicalize_params_1(params: &vte::Params, default: u16) -> u16 {
