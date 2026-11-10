@@ -230,6 +230,9 @@ fn resize_after_compaction_leaves_history_readable() {
         p.process(format!("row {i} with some text").as_bytes());
         p.process(b"\r\n");
     }
+    // The visible screen is reflowed on resize and may push rows into the
+    // history, which would shift what the offset below shows; keep it empty.
+    p.process(b"\x1b[2J\x1b[H");
     let before: Vec<String> = {
         p.screen_mut().set_scrollback(25);
         p.screen().rows(0, 300).collect()

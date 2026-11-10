@@ -104,6 +104,10 @@ impl Row {
         !self.cells.iter().any(|c| c.has_contents())
     }
 
+    pub fn has_text(&self) -> bool {
+        self.cells.iter().any(crate::Cell::is_text)
+    }
+
     /// Every logical column of the row, the stored prefix followed by the
     /// blank cells the unstored tail reads as.  Callers see exactly the same
     /// sequence they saw when every row was dense.
