@@ -217,6 +217,12 @@ impl Cell {
         self.len() > 0
     }
 
+    /// Whether the cell holds a glyph other than a space: what conhost counts
+    /// as text when it trims a row before reflowing it.
+    pub(crate) fn is_text(&self) -> bool {
+        self.has_contents() && self.contents() != " "
+    }
+
     /// Returns whether the text data in the cell represents a wide character.
     #[must_use]
     pub fn is_wide(&self) -> bool {

@@ -426,10 +426,18 @@ impl Screen {
     }
 
     /// Resizes the terminal.
+    ///
+    /// The main screen is reflowed (see `Grid::set_size_reflow`) to stay in
+    /// step with the pseudo console's own buffer; the alternate screen is
+    /// only cut or padded, as a full screen application redraws it anyway.
     pub fn set_size(&mut self, rows: u16, cols: u16) {
-        self.grid.set_size(crate::grid::Size { rows, cols });
+        self.grid.set_size_reflow(crate::grid::Size { rows, cols });
         self.alternate_grid
             .set_size(crate::grid::Size { rows, cols });
+        if self.alternate_saved_cursor.is_some() {
+            let pos = self.grid.pos();
+            self.alternate_saved_cursor = Some((pos.col, pos.row));
+        }
     }
 
     /// Returns the current size of the terminal.

@@ -14,6 +14,12 @@
 // not merely that nothing blew up.
 //
 // Resizing a pane through a CJK glyph is routine, so this is a reachable path.
+//
+// The main screen now reflows on resize (resize_reflow.rs), so the tests that
+// pin down what truncation leaves in a given cell run on the alternate screen,
+// which is still cut rather than reflowed.
+
+const ALT_SCREEN: &[u8] = b"\x1b[?1049h";
 
 fn wide_then_shrink(cols_before: u16, cols_after: u16) -> vt100_psmux::Parser {
     let mut parser = vt100_psmux::Parser::new(2, cols_before, 0);
@@ -75,6 +81,7 @@ fn shrinking_to_exactly_the_wide_char_width_keeps_it_intact() {
 fn wide_char_not_at_the_left_edge_is_handled_too() {
     // Glyph at cols 1 and 2; shrink to 2 columns cuts its continuation.
     let mut parser = vt100_psmux::Parser::new(2, 6, 0);
+    parser.process(ALT_SCREEN);
     parser.process("a\u{4F60}".as_bytes());
     parser.screen_mut().set_size(2, 2);
     parser.process(b"\x1b[K");
@@ -150,7 +157,10 @@ fn erase_survives_at_every_shrink_target() {
 
 #[test]
 fn writing_over_the_orphaned_cell_works() {
-    let mut parser = wide_then_shrink(4, 1);
+    let mut parser = vt100_psmux::Parser::new(2, 4, 0);
+    parser.process(ALT_SCREEN);
+    parser.process("\u{4F60}".as_bytes());
+    parser.screen_mut().set_size(2, 1);
     parser.process(b"x");
     assert_eq!(
         parser.screen().cell(0, 0).map(|c| c.contents()),
@@ -242,6 +252,7 @@ fn erase_to_start_over_a_wide_char_mid_row_is_unchanged() {
 #[test]
 fn shrinking_a_row_with_no_wide_char_is_unchanged() {
     let mut parser = vt100_psmux::Parser::new(2, 8, 0);
+    parser.process(ALT_SCREEN);
     parser.process(b"abcdefgh");
     parser.screen_mut().set_size(2, 3);
     parser.process(b"\x1b[K");

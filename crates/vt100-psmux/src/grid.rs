@@ -142,15 +142,122 @@ impl Grid {
             }
         }
 
-        if self.scroll_bottom == self.size.rows - 1 {
-            self.scroll_bottom = size.rows - 1;
-        }
-
+        let old = self.size;
         self.size = size;
         for row in &mut self.rows {
             row.resize(size.cols, crate::Cell::new());
         }
         self.rows.resize(usize::from(size.rows), self.new_row());
+        self.finish_resize(old);
+    }
+
+    /// Resizes the primary screen the way conhost (the pseudo console behind
+    /// every pane) reflows its own buffer, so later output lands where the
+    /// application expects it.  conhost has no scrollback under ConPTY, so
+    /// only the drawing rows take part: the top row always starts a logical
+    /// line.  Every row up to the last one holding text (or the cursor) is
+    /// kept; when they no longer fit, the top rows go to the scrollback, but
+    /// never so many that the cursor row leaves the screen.
+    pub fn set_size_reflow(&mut self, size: Size) {
+        if size == self.size || self.rows.is_empty() {
+            self.set_size(size);
+            return;
+        }
+
+        let old = self.size;
+        let (mut rows, cursor_row, cursor_col) = if size.cols == old.cols {
+            (std::mem::take(&mut self.rows), usize::from(self.pos.row), self.pos.col)
+        } else {
+            self.reflow_rows(size.cols)
+        };
+        let cursor_row = cursor_row.min(rows.len().saturating_sub(1));
+
+        let height = usize::from(size.rows);
+        let content_end = rows
+            .iter()
+            .rposition(crate::row::Row::has_text)
+            .map_or(0, |last| last + 1)
+            .max(cursor_row + 1);
+        let excess = content_end
+            .min(cursor_row + height)
+            .saturating_sub(height);
+        for row in rows.drain(..excess) {
+            self.push_row_to_scrollback(row);
+        }
+        rows.truncate(height);
+        rows.resize_with(height, || crate::row::Row::new(size.cols));
+
+        self.size = size;
+        self.rows = rows;
+        self.pos = Pos {
+            row: u16::try_from(cursor_row.saturating_sub(excess))
+                .unwrap_or(u16::MAX),
+            col: cursor_col,
+        };
+        self.finish_resize(old);
+    }
+
+    /// Takes the drawing rows apart into logical lines and lays them out
+    /// again `cols` wide, returning the new rows and the cursor's place in
+    /// them.  Trailing spaces of a line are dropped, except up to the cursor.
+    fn reflow_rows(&mut self, cols: u16) -> (Vec<crate::row::Row>, usize, u16) {
+        let old_cols = self.size.cols;
+        let rows = std::mem::take(&mut self.rows);
+        let cursor_row = usize::from(self.pos.row);
+        let cursor_col = usize::from(self.pos.col.min(old_cols.saturating_sub(1)));
+
+        let mut out = Vec::with_capacity(rows.len());
+        let mut cursor = None;
+        let mut line: Vec<crate::Cell> = Vec::new();
+        let mut line_cursor = None;
+        for (i, row) in rows.iter().enumerate() {
+            let next = rows.get(i + 1);
+            let wrapped = row.wrapped() && next.is_some();
+            // A wide glyph that did not fit at the end of a row was moved to
+            // the next one, leaving a blank pad that is not part of the text.
+            let padded = wrapped
+                && old_cols > 1
+                && row
+                    .get(old_cols - 1)
+                    .is_some_and(|c| !c.has_contents() && !c.is_wide_continuation())
+                && next
+                    .and_then(|n| n.get(0))
+                    .is_some_and(crate::Cell::is_wide);
+            let take = if padded { old_cols - 1 } else { old_cols };
+            if i == cursor_row {
+                line_cursor = Some(line.len() + cursor_col);
+            }
+            line.extend(
+                (0..take).map(|col| {
+                    row.get(col).cloned().unwrap_or_else(crate::Cell::new)
+                }),
+            );
+            if !wrapped {
+                let tail = row
+                    .get(old_cols.saturating_sub(1))
+                    .map(|c| *c.attrs())
+                    .unwrap_or_default();
+                let placed = lay_out_line(
+                    &mut out,
+                    std::mem::take(&mut line),
+                    line_cursor.take(),
+                    cols,
+                    tail,
+                );
+                cursor = cursor.or(placed);
+            }
+        }
+
+        let (row, col) =
+            cursor.unwrap_or((out.len().saturating_sub(1), 0));
+        (out, row, col)
+    }
+
+    fn finish_resize(&mut self, old: Size) {
+        let size = self.size;
+        if self.scroll_bottom == old.rows.saturating_sub(1) {
+            self.scroll_bottom = size.rows.saturating_sub(1);
+        }
 
         if self.scroll_bottom >= size.rows {
             self.scroll_bottom = size.rows - 1;
@@ -943,6 +1050,96 @@ impl Grid {
             self.pos.col = self.size.cols - 1;
         }
     }
+}
+
+/// Appends one logical line to `out`, wrapped at `cols`, and returns where
+/// the cell at `cursor` (an offset into `cells`) landed.  The rest of the
+/// last row takes the attributes the line ended with, as conhost extends a
+/// row's trailing attribute run.
+fn lay_out_line(
+    out: &mut Vec<crate::row::Row>,
+    mut cells: Vec<crate::Cell>,
+    cursor: Option<usize>,
+    cols: u16,
+    tail: crate::attrs::Attrs,
+) -> Option<(usize, u16)> {
+    let mut len = cells
+        .iter()
+        .rposition(crate::Cell::is_text)
+        .map_or(0, |last| last + 1);
+    if len > 0 && cells.get(len - 1).is_some_and(crate::Cell::is_wide) {
+        len += 1;
+    }
+    if let Some(cursor) = cursor {
+        len = len.max(cursor + 1);
+    }
+    cells.resize(len, crate::Cell::new());
+
+    out.push(crate::row::Row::new(cols));
+    let mut placed = None;
+    let mut col: u16 = 0;
+    let mut cells = cells.into_iter().enumerate().peekable();
+    while let Some((idx, mut cell)) = cells.next() {
+        let mut continuation = None;
+        let mut consumed = false;
+        if cell.is_wide() {
+            continuation = cells
+                .next_if(|(_, next)| next.is_wide_continuation())
+                .map(|(_, next)| next);
+            consumed = continuation.is_some();
+            if cols < 2 {
+                // Nowhere to put a two column glyph; tmux shows nothing.
+                let attrs = *cell.attrs();
+                cell.clear(attrs);
+                continuation = None;
+            } else if continuation.is_none() {
+                let mut next = crate::Cell::new();
+                next.set_wide_continuation(true);
+                continuation = Some(next);
+            }
+        } else if cell.is_wide_continuation() {
+            let attrs = *cell.attrs();
+            cell.clear(attrs);
+            cell.set_wide_continuation(false);
+        }
+        let width: u16 = if continuation.is_some() { 2 } else { 1 };
+
+        if col.saturating_add(width) > cols {
+            if let Some(row) = out.last_mut() {
+                row.wrap(true);
+            }
+            out.push(crate::row::Row::new(cols));
+            col = 0;
+        }
+        let row_idx = out.len().saturating_sub(1);
+        if cursor == Some(idx) {
+            placed = Some((row_idx, col));
+        } else if consumed && cursor == Some(idx + 1) {
+            placed = Some((row_idx, col + width - 1));
+        }
+        if let Some(row) = out.last_mut() {
+            if let Some(slot) = row.get_mut(col) {
+                *slot = cell;
+            }
+            if let Some(next) = continuation {
+                if let Some(slot) = row.get_mut(col + 1) {
+                    *slot = next;
+                }
+            }
+        }
+        col += width;
+    }
+
+    if tail != crate::attrs::Attrs::default() {
+        if let Some(row) = out.last_mut() {
+            for c in col..cols {
+                if let Some(slot) = row.get_mut(c) {
+                    slot.clear(tail);
+                }
+            }
+        }
+    }
+    placed
 }
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
